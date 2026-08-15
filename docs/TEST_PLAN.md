@@ -168,9 +168,9 @@ The gap is measured by recording a per-partition timeline of processed-message t
 looking for an interval exceeding a threshold on partitions the survivor kept — determined from
 `ConsumerRebalanceListener` callbacks, not guessed.
 
-### Scoping the measurement window — two harness bugs worth recording
+### Scoping the measurement window — three harness bugs worth recording
 
-Both of these made cooperative look identical to eager, i.e. the test reported a real-looking
+All three made cooperative look identical to eager, i.e. the test reported a real-looking
 problem that did not exist. In a test whose entire value is distinguishing the two assignors,
 that is the failure mode to guard against:
 
@@ -180,6 +180,26 @@ that is the failure mode to guard against:
 2. **Closing a consumer fires `onPartitionsRevoked` for everything it holds**, and the list was
    read *after* the survivor's own teardown — measuring our shutdown rather than the rebalance.
    All 6 partitions appeared revoked under cooperative. The snapshot is now taken before shutdown.
+3. **The survivor died two seconds into a twenty-second run, and nothing noticed.** Found in PR
+   review, and the worst of the three because it was silent. Three separate causes compounded:
+   - `commitSync()` throws while a rebalance is in flight — routine, and guaranteed during the
+     cooperative revocation round at group formation. A blanket `catch (Exception)` around the
+     poll loop treated it as fatal and exited.
+   - `close()` then fired **`onPartitionsLost`**, and Kafka's *default* `onPartitionsLost`
+     delegates to `onPartitionsRevoked` — so a fencing event was filed as an assignor decision.
+   - The resulting outcome — empty retained, empty revoked — looks exactly like a legitimate
+     measurement. The cooperative case failed on it; **the eager control would have passed on
+     it**, because a dead consumer's `close()` supplies the very revocations the control looks
+     for. The control could have gone green while measuring a corpse.
+
+   Fixed by overriding `onPartitionsLost` separately, tolerating rebalance-time commit failures,
+   recording any fatal error instead of swallowing it, and gating **both** runs on an explicit
+   `assertHarnessWasHealthy` — the survivor must be alive, unfenced, and actually holding
+   partitions before any number it produced is trusted.
+
+The eager control also now asserts the cooperative claim *in the cooperative test's own form* —
+that the retained set is *empty* under `RangeAssignor` — so falsifiability is demonstrated
+directly rather than inferred from a related quantity.
 
 **Flakiness control:** rebalance timing is inherently racy, so the gap threshold is deliberately
 generous (2.5s). The claim under test is "no stop-the-world", not "sub-second scheduling" — a
