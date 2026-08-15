@@ -1,0 +1,289 @@
+# Real-Time Fraud Detection Pipeline
+
+Seven Spring Boot services that decide **ALLOW / REVIEW / BLOCK** on a payment before it
+completes, within a hard 150ms budget — over a fully asynchronous Kafka backbone.
+
+Everything runs locally on real infrastructure: real Kafka, real Redis, real Couchbase. No
+in-memory fakes, no cloud dependency, one `docker compose up`.
+
+> **Status: documentation and design complete; services not yet implemented.**
+> This repository currently contains the build specification, the full design set (HLD, LLD, 14
+> ADRs, contracts, test plan, runbook), and the backlog. Implementation follows the phase order in
+> [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt). See [Build status](#build-status).
+
+---
+
+## The interesting problem
+
+A payment caller needs an answer **in this request cycle** — it cannot complete a payment without
+knowing whether it is fraud. But the detection pipeline wants to be **asynchronous** internally,
+so that one slow stage cannot cascade, stages scale independently, and everything is replayable.
+
+Those two requirements are in direct conflict, and the resolution is the core of the design:
+
+```mermaid
+graph LR
+    M[mock-payment-api] -->|1 . sync HTTP| G[gateway-service]
+    G -->|2 . subscribe FIRST| R[(Redis Pub/Sub)]
+    G -->|3 . sync, fast| I[ingestion-service]
+    I -->|4 . outbox| K[(Kafka)]
+    K --> E[enrichment] --> S[scoring] --> D[decision]
+    D -->|5 . PUBLISH| R
+    R -->|6 . sub-ms wakeup| G
+    G -->|7 . 200 OK| M
+    D --> A[action-audit]
+    A -.->|reconcile if we guessed wrong| M
+
+    style G fill:#2d4a6b,color:#fff
+    style R fill:#6b2d2d,color:#fff
+```
+
+**One synchronous leg** to durably accept the transaction, then a **bounded, event-driven wait**
+on a Redis Pub/Sub channel keyed by correlation ID. Sub-millisecond wakeup, and on WebFlux no
+thread is held while waiting. If 150ms elapses first the caller gets **REVIEW — never ALLOW** —
+and the pipeline keeps running, with a webhook reconciling later if the real decision differs.
+
+Three details that make it work, each with a failure mode it prevents:
+
+- **Subscribe before ingesting.** Redis Pub/Sub has no persistence. On a warm stack the pipeline
+  finishes in under 40ms — faster than the gateway could call ingestion and *then* subscribe. Get
+  the order wrong and every request times out, and the failure gets **worse the faster your
+  pipeline is**. → [ADR-0003](docs/adr/0003-pubsub-not-polling.md)
+- **Transactional outbox.** The transaction record and its outbox event commit in one Couchbase
+  ACID transaction. Without it, a crash between the DB write and the Kafka publish leaves a
+  transaction that is durably recorded and **silently never scored**.
+  → [ADR-0005](docs/adr/0005-transactional-outbox.md)
+- **REVIEW, never ALLOW, on timeout.** Otherwise every GC pause and rebalance silently becomes
+  "let everything through" — and load spikes correlate with fraud waves.
+  → [ADR-0004](docs/adr/0004-review-not-allow-on-timeout.md)
+
+---
+
+## Services
+
+| Service | Port | Role |
+|---|---:|---|
+| `mock-payment-api` | 8080 | Simulated upstream caller + webhook receiver. Makes the sync/async seam demonstrable rather than hypothetical. |
+| `gateway-service` | 8081 | **WebFlux.** HMAC JWT, rate limiting, correlation ID, and the bounded wait. |
+| `ingestion-service` | 8082 | Idempotency + the outbox. Owns the durability boundary. |
+| `enrichment-service` | 8083 | Behavioural signals from Redis, all via atomic Lua scripts. |
+| `scoring-service` | 8084 | Weighted rule engine. Hot-reloadable, no restart. |
+| `decision-service` | 8085 | Policy thresholds → ALLOW/REVIEW/BLOCK. Publishes the wakeup. |
+| `action-audit-service` | 8086 | Append-only ledger, alerts, webhook reconciliation. |
+
+Each is an independent Maven project with its own `pom.xml` and Dockerfile. **No shared compiled
+library** — contracts are JSON Schema in [`docs/CONTRACTS.md`](docs/CONTRACTS.md), and every
+consumer is a tolerant reader. → [ADR-0002](docs/adr/0002-no-shared-dto-jar.md)
+
+---
+
+## Quick start
+
+**Requirements:** Docker + Compose v2, Java 21, ~4.6 GB free RAM, ~4 GB free disk.
+Maven is *not* required — each service ships a script-only Maven Wrapper.
+
+```bash
+./scripts/preflight.sh        # checks RAM + disk, fails loudly rather than mid-build
+docker compose up -d          # infra, init jobs, then all 7 services
+./scripts/smoke-test.sh       # exercises every scenario, prints PASS/FAIL per scenario
+```
+
+Init containers create the 9 Kafka topics, the Couchbase bucket / 3 scopes / 7 collections, the
+N1QL indexes and the 8 seed rules automatically. There are no manual setup steps.
+
+### Try it by hand
+
+```bash
+# clean transaction → ALLOW
+curl -s -X POST localhost:8080/payments/initiate \
+  -H 'Content-Type: application/json' \
+  -d '{"transactionId":"txn-demo-1","customerId":"cust-1","merchantId":"merch-1",
+       "merchantCategoryCode":"5411","amount":150.00,"currency":"INR",
+       "countryCode":"IN","deviceId":"dev-1","paymentMethod":"CARD"}' | jq
+```
+```json
+{ "status": "COMPLETED", "fraudDecision": "ALLOW", "riskScore": 0,
+  "resolvedBy": "PIPELINE" }
+```
+
+`resolvedBy` is the field to watch: `PIPELINE` means a real decision arrived inside the budget;
+`TIMEOUT_DEFAULT` means you got the safe default. In production, `TIMEOUT_DEFAULT ÷ total` is the
+system's primary SLO.
+
+```bash
+# trip the velocity rule — 6 transactions in under a minute
+for i in $(seq 1 6); do
+  curl -s -X POST localhost:8080/payments/initiate \
+    -H 'Content-Type: application/json' \
+    -d "{\"transactionId\":\"txn-vel-$i\",\"customerId\":\"cust-velocity\",
+         \"merchantId\":\"merch-1\",\"merchantCategoryCode\":\"5411\",\"amount\":100.00,
+         \"currency\":\"INR\",\"countryCode\":\"IN\",\"deviceId\":\"dev-1\",
+         \"paymentMethod\":\"CARD\"}" | jq -c '{i:'$i', d:.fraudDecision, s:.riskScore}'
+done
+```
+
+The 6th trips `VELOCITY_1M` (threshold 5, weight 30) → score 30 → **REVIEW / HELD**.
+
+```bash
+# follow one transaction across all 7 services
+docker compose logs --no-color | grep "$(curl -s ... | jq -r .correlationId)"
+
+# change a rule with no restart, as a fraud analyst would
+# (edit rule::VELOCITY_1M in Couchbase, then:)
+curl -X POST localhost:8084/admin/rules/refresh
+```
+
+---
+
+## How to test
+
+```bash
+cd scoring-service && ./mvnw verify   # one service — Testcontainers, real infra
+./scripts/test-all.sh                 # everything
+./scripts/smoke-test.sh               # end-to-end against a live stack
+```
+
+Ten scenarios from spec §10 are implemented as automated tests against **real** Kafka, Redis and
+Couchbase. Full detail: [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md).
+
+Two are worth calling out because of *how* they are written:
+
+- **T5** (cooperative rebalancing) is parameterized across **both** assignors and asserts the
+  scenario *fails* under `RangeAssignor`. The naive version — kill an instance, assert everything
+  eventually processed — passes under eager rebalancing too, and would prove nothing.
+- **T6** (Redis outage) asserts degraded signal keys are **absent** from the signal map, not that
+  they are zero. A test asserting `velocity_1m == 0` would pass on the zero-defaulting
+  implementation that [ADR-0014](docs/adr/0014-redis-fail-open.md) specifically rejects.
+
+---
+
+## What would break, and how you would notice
+
+The three signals that matter, and what they mean:
+
+| Signal | Healthy | What it tells you |
+|---|---|---|
+| `TIMEOUT_DEFAULT ÷ total decisions` | < 1% | What fraction of decisions were *real* decisions |
+| `fraud_ingestion_outbox_pending` | ≈ 0 | Climbing = Kafka unreachable or publisher dead. Earliest warning available. |
+| `fraud_enrichment_signal_degraded_total` | 0 | Decisions being made partly blind |
+
+### Redis outage
+Payments **keep flowing** — this is designed, not broken. Velocity/geo/device signals are
+**omitted** (never defaulted to zero — zero is a positive claim of innocence, invented from
+nothing) and `signalsDegraded: true` is carried onto the decision and into the audit ledger. Rate
+limiting fails open. Idempotency survives, because its authority is Couchbase `insert()`, not
+Redis. **Accepted risk:** velocity-based fraud is likelier to succeed during the outage; every
+affected decision is identifiable afterwards.
+*Notice it:* `signal_degraded` counter, WARN logs in enrichment.
+
+### Kafka consumer rebalance
+Only the partitions actually transferring pause; the rest keep flowing. Expect a small bump in
+`TIMEOUT_DEFAULT`, not a cliff. **If the whole group stalls, cooperative rebalancing is not in
+effect** — most likely a *mixed* group, since one eager member forces the entire group back to
+eager.
+*Notice it:* consumer-group lag on non-transferring partitions.
+
+### Kafka down
+Ingestion still returns 202 — the Couchbase commit is the durability boundary. Outbox rows
+accumulate as `PENDING`. **Nothing is lost.** Drains automatically on recovery.
+
+### Couchbase down
+The one place the system fails **closed**: ingestion returns 503. Accepting a transaction that
+cannot be made durable would be a promise the system cannot keep.
+
+Full symptom-first guide, including the immortal-Redis-counter bug and the stuck-partition case:
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
+---
+
+## Documentation
+
+| Document | What is in it |
+|---|---|
+| [HLD](docs/HLD.md) | Architecture, the sync/async seam, topic topology, latency budget, failure domains |
+| [LLD](docs/LLD.md) | Cross-cutting design + [per-service](docs/lld/) internals, class designs, sequence diagrams |
+| [CONTRACTS](docs/CONTRACTS.md) | JSON Schema for every message shape. **Load-bearing** — there is no shared DTO jar |
+| [ADRs](docs/adr/) | 14 decisions, each with its naive alternative and named failure mode |
+| [TEST_PLAN](docs/TEST_PLAN.md) | T1–T10 acceptance criteria |
+| [RUNBOOK](docs/RUNBOOK.md) | Symptom-first operations guide |
+| [INTERVIEW_PREP](docs/INTERVIEW_PREP.md) | Design walkthrough, trade-off drills, failure-mode Q&A |
+
+---
+
+## Stack
+
+Java 21 · **Spring Boot 4.1.0** · Apache Kafka 4.2 (KRaft, single node) · Redis 7 ·
+Couchbase Server 7.6 Community Edition · Testcontainers 2.0.5 · Micrometer + Prometheus
+
+**On Spring Boot:** the spec pins 3.3.x, but every Spring Boot 3.x branch is EOL as of mid-2026 —
+3.5.16 was the final OSS 3.x release. Running an unpatched runtime in the payment path contradicts
+the system's purpose, so this builds on 4.1.0. The full dependency set was resolved and every
+load-bearing class verified present *before* any code was written.
+→ [ADR-0001](docs/adr/0001-spring-boot-4.md)
+
+**On Couchbase Community Edition:** the spec assumes multi-document ACID transactions work on CE,
+which the entire outbox pattern depends on. Couchbase's product-comparison page lists distributed
+transactions as Enterprise, which would invalidate it. The spec is right and the page is
+misleading — SDK transactions are implemented client-side via ATR documents, with no server-side
+service to license. Because the cost of being wrong is high and discovered late, Phase 1 gates on
+a real transaction commit against the CE container before the outbox is built.
+→ [ADR-0013](docs/adr/0013-couchbase-ce-single-node-kraft.md)
+
+---
+
+## Deliberate simplifications
+
+Real in production, deliberately out of scope here (spec §13), each filed as a GitHub issue so the
+omission is visible rather than forgotten:
+
+- **Authentication is a shared-secret HMAC JWT**, not a real identity provider. Sufficient to
+  demonstrate the boundary; a real IdP with JWKS is tracked.
+- **Single Kafka broker, RF=1.** A three-broker Compose setup would share one disk and one failure
+  domain — it would test nothing that RF=1 does not, while claiming to test replication.
+- **No Kubernetes, Helm, or cloud resources.**
+- **No ML scoring.** The deterministic weighted-rule engine is the complete scope of "scoring" —
+  and it is what makes total explainability achievable.
+- **No Prometheus/Grafana containers.** Micrometer instrumentation is present and required;
+  dashboards are not.
+
+### Known gap
+
+There is **no circuit breaker** on gateway → ingestion. Redis fail-open is graceful degradation,
+not a breaker, and the 150ms timeout is a crude bulkhead. If ingestion became slow rather than
+dead, the gateway would keep sending requests already doomed to time out. Resilience4j there is
+the first thing to fix, and it is tracked as an issue.
+
+---
+
+## Build status
+
+Built in the phase order of spec §12, each phase gated on its acceptance tests.
+
+| Phase | Scope | Exit criteria | Status |
+|---|---|---|---|
+| — | Design, contracts, ADRs, backlog | — | ✅ Done |
+| 1 | Infra skeleton + init jobs | Topics, bucket, seed rules, **CE transaction probe** | ⬜ |
+| 2 | Ingestion path + outbox | T3, T4 | ⬜ |
+| 3 | Enrichment + scoring | T2, T8, Lua concurrency | ⬜ |
+| 4 | Decision + sync facade | T1, T6, T7a | ⬜ |
+| 5 | Action, audit, reconciliation | T7b, T9, T10 | ⬜ |
+| 6 | Rebalance behaviour | T5 | ⬜ |
+
+Not "done" until T1–T10 pass against the real Compose stack, not only against Testcontainers.
+
+---
+
+## Repository layout
+
+```
+├── docker-compose.yml
+├── FRAUD_PIPELINE_BUILD_SPEC.txt     the source of truth for requirements
+├── docs/                             HLD, LLD, ADRs, contracts, test plan, runbook, interview prep
+├── infra/
+│   ├── kafka-init/                   topic creation
+│   └── couchbase-init/               bucket/scopes/collections/indexes + 8 seed rules
+├── scripts/                          preflight, smoke-test, test-all
+├── mock-payment-api/  gateway-service/  ingestion-service/
+├── enrichment-service/  scoring-service/  decision-service/  action-audit-service/
+└── future-work/                      design-only, explicitly unexercised
+```

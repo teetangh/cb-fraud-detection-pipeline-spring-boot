@@ -1,0 +1,109 @@
+Service count
+
+7 Spring Boot services (the spec says "8" but item 8 is the one-shot init container, not a service):
+
+┌─────┬──────────────────────┬────────────────────────────────────────────────────┬───────────────────────────┐
+│  #  │       Service        │                        Role                        │        Sync/Async         │
+├─────┼──────────────────────┼────────────────────────────────────────────────────┼───────────────────────────┤
+│ 1   │ mock-payment-api     │ Stand-in upstream caller                           │ HTTP in/out               │
+├─────┼──────────────────────┼────────────────────────────────────────────────────┼───────────────────────────┤
+│ 2   │ gateway-service      │ Auth, rate limit, correlation ID, the bounded wait │ WebFlux (reactive)        │
+├─────┼──────────────────────┼────────────────────────────────────────────────────┼───────────────────────────┤
+├─────┼──────────────────────┼────────────────────────────────────────────────────┼───────────────────────────┤
+│ 3   │ ingestion-service    │ Idempotency + outbox write                         │ HTTP in, Kafka out        │
+├─────┼──────────────────────┼────────────────────────────────────────────────────┼───────────────────────────┤
+│ 4   │ enrichment-service   │ Redis signal computation                           │ Kafka → Kafka             │
+├─────┼──────────────────────┼────────────────────────────────────────────────────┼───────────────────────────┤
+│ 5   │ scoring-service      │ Weighted rule engine                               │ Kafka → Kafka             │
+├─────┼──────────────────────┼────────────────────────────────────────────────────┼───────────────────────────┤
+│ 6   │ decision-service     │ Policy thresholds → ALLOW/REVIEW/BLOCK             │ Kafka → Kafka + Redis pub │
+├─────┼──────────────────────┼────────────────────────────────────────────────────┼───────────────────────────┤
+│ 7   │ action-audit-service │ Append-only ledger, webhook reconciliation         │ Kafka → HTTP              │
+└─────┴──────────────────────┴────────────────────────────────────────────────────┴───────────────────────────┘
+
+Plus 9 Kafka topics (6 main + 3 DLQ), 3 Couchbase scopes / 7 collections.
+
+What's actually in the build
+
+┌─────────────────────────┬──────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────┐
+│         Pattern         │            Where             │                                   Why it's interview-strong                                   │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Transactional Outbox    │ ingestion-service, §9.2      │ The headline. Couchbase multi-doc ACID txn writes txn+outbox atomically; background publisher │
+│                         │                              │  marks PUBLISHED only after producer ack.                                                     │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Sync facade over async  │ gateway ↔ Redis Pub/Sub, §6  │ Genuinely uncommon. One sync leg, then a push-based Mono.timeout(150ms) wait — not a poll     │
+│ backbone                │                              │ loop. You can defend it with latency math (a 20ms poll wastes 10ms average).                  │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Idempotent receiver     │ Redis key + insert() not     │ Two-layer: cache fast-path, DB constraint as the authoritative guard.                         │
+│                         │ upsert(), §9.1               │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Fail-safe default       │ REVIEW-not-ALLOW on timeout, │ "Which way does your system fail?" — has a crisp, principled answer.                          │
+│                         │  §9.8                        │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Cooperative sticky      │ every consumer, §9.5         │ Very few candidates can explain eager vs cooperative rebalance, let alone prove it with a     │
+│ rebalancing             │                              │ test (T5).                                                                                    │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Manual post-work offset │ every consumer, §9.6         │ At-least-once done correctly; the redelivery-safe-vs-loss-causing distinction.                │
+│  commit                 │                              │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Partition key =         │ customerId, §7               │ Velocity counters would race if one customer's events split across partitions.                │
+│ ordering guarantee      │                              │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ DLQ / poison message    │ 3 .dlq topics                │ Opaque payload envelope — you can't re-parse what failed to parse.                            │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Append-only audit       │ §9.7                         │ Enforced at the Java interface level, so mutation is a compile error, not a convention.       │
+│ ledger                  │                              │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Policy/scoring          │ §9.4                         │ Governance argument: an auditor can distinguish "model changed" from "policy changed".        │
+│ separation              │                              │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Server-side atomicity   │ Redis Lua EVAL, §9.3         │ Check-then-act race elimination.                                                              │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Hot-reloadable config   │ rules from Couchbase, 60s +  │ Business change without a deploy.                                                             │
+│                         │ force-refresh                │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Graceful degradation    │ Redis down → signals absent, │ Subtle: velocity_1m: 0 asserts "quiet customer"; absent means "unknown". Different scoring    │
+│                         │  not zero                    │ outcomes.                                                                                     │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Tolerant reader /       │ CONTRACTS.md                 │ How you deploy 7 services independently without a shared jar.                                 │
+│ schema evolution        │                              │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ API Gateway + rate      │ gateway-service              │ Standard, but present and real.                                                               │
+│ limiting                │                              │                                                                                               │
+├─────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Correlation ID          │ MDC → structured JSON logs   │ docker compose logs | grep <id> reconstructs one txn across 7 services.                       │
+│ propagation             │                              │                                                                                               │
+└─────────────────────────┴──────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────┘
+
+What's deliberately NOT here — and this is the better interview material
+
+┌──────────────────────┬─────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│       Pattern        │   Status    │                                                   What to say                                                    │
+├──────────────────────┼─────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                      │             │ This is the point of the outbox. There is no distributed transaction across Couchbase and Kafka — 2PC would need │
+│ 2PC / XA             │ ❌ Never    │  a coordinator, blocks on coordinator failure, and Kafka doesn't do XA. The outbox reduces it to one local ACID  │
+│                      │             │ transaction plus an idempotent retry. Strongest single answer in the project.                                    │
+├──────────────────────┼─────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                      │ ❌ Not      │ Honest answer: there's nothing to compensate — the pipeline is a read-only decision flow, not a multi-service    │
+│ Saga                 │ present     │ money movement. The webhook reconciliation is a compensating notification, not a saga step. If asked "where      │
+│                      │             │ would a saga go?" → the downstream payment capture/reversal that mock-payment-api stands in for.                 │
+├──────────────────────┼─────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Service discovery    │ ❌ Not      │ Docker Compose DNS. Defensible: at 7 services on one host, a discovery server is infrastructure you'd have to    │
+│ (Eureka/Consul)      │ present     │ operate for no benefit. In the k8s target (future-work) it's Services + DNS, still no Eureka.                    │
+├──────────────────────┼─────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Service mesh         │ ❌ Out of   │ Would give mTLS, retries, circuit breaking at L7 without code. Explicitly deferred with k8s.                     │
+│ (Istio/Linkerd)      │ scope, §13  │                                                                                                                  │
+├──────────────────────┼─────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Exactly-once (Kafka  │ ❌ Not used │ At-least-once + idempotent consumers is the cheaper, more available choice. EOS costs throughput and only holds  │
+│ txns)                │             │ within Kafka — it doesn't cover the Couchbase write anyway.                                                      │
+├──────────────────────┼─────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Circuit breaker      │ ⚠️ Genuine  │ Redis fail-open is degradation, not a breaker. If pressed: the 150ms timeout is a crude bulkhead, but there's no │
+│ (Resilience4j)       │ gap         │  breaker on the ingestion HTTP call. Worth flagging as honest.                                                   │
+├──────────────────────┼─────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Event sourcing /     │ ⚠️ Partial  │ The audit ledger is append-only and the Kafka topics are a real event log, but state isn't rebuilt from events.  │
+│ CQRS                 │             │                                                                                                                  │
+├──────────────────────┼─────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Backpressure         │ ⚠️ Partial  │ WebFlux gives it on the sync leg; Kafka consumer poll gives natural pull-based flow control.                     │
+└──────────────────────┴─────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+The three I'd lead with in an interview: outbox-instead-of-2PC, the push-based bounded wait with a fail-safe default, and cooperative sticky rebalancing — because that last one is the rare case where you can say "and here's the test that fails if you configure it the naive way."
