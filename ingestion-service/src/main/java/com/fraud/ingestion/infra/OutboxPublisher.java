@@ -134,9 +134,21 @@ public class OutboxPublisher {
         }
     }
 
-    /** Post-commit nudge: latency optimisation only. The timer is the guarantee. */
+    /**
+     * Post-commit nudge: latency optimisation only. The timer is the guarantee.
+     *
+     * <p>The executor MUST be named explicitly. Both {@code outboxNudgeExecutor}
+     * (from {@link com.fraud.ingestion.config.AsyncConfig}) and Spring's
+     * auto-configured {@code taskScheduler} (present because
+     * {@code @EnableScheduling} is on, for {@link #publishPending()}) implement
+     * {@code TaskExecutor}, so an unqualified {@code @Async} is ambiguous.
+     * Spring resolves that ambiguity by logging a WARN and silently falling back
+     * to an unbounded {@code SimpleAsyncTaskExecutor} — one new thread per
+     * invocation, no queue, no {@code CallerRunsPolicy} — which defeats the
+     * bounded pool {@code AsyncConfig} exists to provide.
+     */
     @EventListener
-    @Async
+    @Async("outboxNudgeExecutor")
     public void onCommitted(TransactionIngestor.OutboxRecordCommitted event) {
         publishPending();
     }
