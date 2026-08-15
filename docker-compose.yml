@@ -215,6 +215,58 @@ services:
     mem_limit: 320m
     networks: [fraud-net]
 
+  gateway-service:
+    build:
+      context: ./gateway-service
+    container_name: fraud-gateway
+    hostname: gateway-service
+    ports:
+      - "${GATEWAY_PORT:-8081}:8081"
+    depends_on:
+      redis: {condition: service_healthy}
+      ingestion-service: {condition: service_healthy}
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      INGESTION_URL: http://ingestion-service:8082
+      JWT_SECRET: ${JWT_SECRET:-local-dev-only-not-a-real-secret-change-me}
+      RATE_LIMIT_RPM: ${RATE_LIMIT_RPM:-100}
+      JAVA_OPTS: >-
+        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    mem_limit: 320m
+    networks: [fraud-net]
+
+  mock-payment-api:
+    build:
+      context: ./mock-payment-api
+    container_name: fraud-mock-payment-api
+    hostname: mock-payment-api
+    ports:
+      - "${MOCK_PAYMENT_PORT:-8080}:8080"
+    depends_on:
+      gateway-service: {condition: service_healthy}
+    environment:
+      GATEWAY_URL: http://gateway-service:8081
+      # Must match the gateway's secret — with a symmetric secret, minter and
+      # verifier share one key. That is the weakness, not an accident (issue #6).
+      JWT_SECRET: ${JWT_SECRET:-local-dev-only-not-a-real-secret-change-me}
+      JAVA_OPTS: >-
+        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    mem_limit: 320m
+    networks: [fraud-net]
+
 volumes:
   kafka-data:
   couchbase-data:
