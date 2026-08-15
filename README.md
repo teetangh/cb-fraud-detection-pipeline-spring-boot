@@ -319,7 +319,7 @@ Built in the phase order of spec §12, each phase gated on its acceptance tests.
 | — | Design, contracts, ADRs, backlog | — | ✅ Done |
 | 1 | Infra skeleton + init jobs | Topics, bucket, seed rules, **CE transaction probe** | ✅ Done |
 | 2a | `ingestion-service` + outbox | **T3, T4** | ✅ Done |
-| 2b | `mock-payment-api` + gateway skeleton | full sync chain | ⬜ |
+| 2b | `mock-payment-api` + gateway skeleton | full sync chain | ✅ Done |
 | 3 | Enrichment + scoring | T2, T8, Lua concurrency | ⬜ |
 | 4 | Decision + sync facade | T1, T6, T7a | ⬜ |
 | 5 | Action, audit, reconciliation | T7b, T9, T10 | ⬜ |

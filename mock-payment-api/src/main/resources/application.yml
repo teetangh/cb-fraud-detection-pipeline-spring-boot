@@ -1,0 +1,41 @@
+spring:
+  application:
+    name: mock-payment-api
+
+fraud:
+  jwt:
+    # Same shared secret the gateway verifies with — spec §13's simplification.
+    secret: ${JWT_SECRET:local-dev-only-not-a-real-secret-change-me}
+  gateway:
+    base-url: ${GATEWAY_URL:http://localhost:8081}
+    connect-timeout-ms: 500
+    # DELIBERATELY far above the gateway's own 150ms budget. The gateway always
+    # answers within that budget — real decision or safe default — so a client
+    # timeout below it would abort a request that was about to succeed.
+    read-timeout-ms: 2000
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      service: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        payment.fraud.latency: true
+
+logging:
+  structured:
+    format:
+      console: ecs
+  level:
+    com.fraud.mock: INFO
