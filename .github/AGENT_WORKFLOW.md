@@ -73,6 +73,39 @@ Judge each comment against the authority order in step 1, then:
 A CodeRabbit comment is evidence, not an instruction. Where it contradicts a merged ADR, the ADR
 wins — and you say so on the thread rather than just declining.
 
+#### Waiting for it, without stalling
+
+**Poll the check, not the comment list.** An empty comment list means "not posted yet" and
+"nothing to say" *identically* — you cannot tell them apart, and treating the second as the first
+is how an agent waits forever on a review that already finished:
+
+```bash
+gh pr view <N> --json statusCheckRollup \
+  --jq '.statusCheckRollup[] | select(.name == "CodeRabbit") | .conclusion'
+```
+
+`SUCCESS` = review complete, go fetch the inline comments. `PENDING` = keep waiting.
+
+**Bound the wait to ~45 minutes.** CodeRabbit's free tier rate-limits, and a rate-limited review
+can take that long or never arrive. This is not hypothetical: on PR #11 an agent waited 69 minutes
+on a review that had *already completed*, because it watched for comments instead of the check.
+
+On expiry, proceed on your own review — but **say so on the PR**: that CodeRabbit did not respond
+in the window, that you reviewed independently, and that all other gates passed. Never merge
+silently past a CodeRabbit timeout; the record must show it was skipped and why.
+
+A **re-review of a fix commit** gets a shorter leash — ~10 minutes. The substantive round has
+already happened and every finding has been answered.
+
+#### Replies go on the thread
+
+```bash
+gh api repos/{owner}/{repo}/pulls/<N>/comments/<comment_id>/replies -f body="..."
+```
+
+A summary comment on the PR does **not** discharge this. Thread replies are what a future reader
+follows to find out why a specific line is the way it is.
+
 ### 1. Then review it yourself, and fix only after
 
 Read the diff against three things, in this order of authority:
