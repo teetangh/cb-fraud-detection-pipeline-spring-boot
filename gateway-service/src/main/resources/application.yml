@@ -14,7 +14,10 @@ fraud:
   jwt:
     # Shared secret — spec §13's accepted simplification. Note the weakness:
     # with a symmetric secret every verifier can also mint. Issue #6.
-    secret: ${JWT_SECRET:local-dev-only-not-a-real-secret-change-me}
+    # REQUIRED, no fallback (issue #20). A checked-in default secret is a
+    # publicly-known signing key: a gateway deployed without JWT_SECRET set would
+    # happily accept tokens forged by anyone who has read this repository.
+    secret: ${JWT_SECRET}
   ingestion:
     base-url: ${INGESTION_URL:http://localhost:8082}
     # Comfortably above ingestion's own work, but well under any caller patience.

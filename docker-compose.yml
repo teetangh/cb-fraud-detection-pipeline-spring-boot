@@ -168,6 +168,14 @@ services:
     entrypoint: ["/bin/bash", "/init/init.sh"]
     environment:
       CB_HOST: couchbase
+      # The services themselves REQUIRE CB_USER/CB_PASSWORD with no fallback
+      # (issue #20) — a service deployed without credentials must fail to start
+      # rather than quietly reach for a built-in default.
+      #
+      # Compose supplies them here deliberately, so `docker compose up` stays a
+      # single command with no setup step (spec §14). The fallbacks below are
+      # therefore scoped to LOCAL DEV ONLY and are visible in the file rather
+      # than hidden in the application. Override in .env; see .env.example.
       CB_USER: ${CB_USER:-Administrator}
       CB_PASSWORD: ${CB_PASSWORD:-password}
       CB_BUCKET: ${CB_BUCKET:-fraud-detection}

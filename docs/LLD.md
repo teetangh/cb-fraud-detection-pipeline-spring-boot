@@ -70,7 +70,9 @@ boolean matches(RuleOperator op, SignalValue v) {
 
 ## 3. Configuration conventions
 
-All configuration is environment-overridable so one image runs in Compose and in tests.
+All configuration is environment-overridable so one image runs in Compose and in tests — with one
+deliberate exception: **credentials have no fallback value** (issue #20). See the note below the
+skeleton.
 
 ```yaml
 spring:
@@ -98,9 +100,9 @@ spring:
     timeout: 200ms                              # ADR-0014 — short, so failure is fast
 couchbase:
   connection-string: ${CB_CONNECTION:couchbase://localhost}
-  username: ${CB_USER:Administrator}
-  password: ${CB_PASSWORD:password}
-  bucket: fraud-detection
+  username: ${CB_USER}                          # REQUIRED — no fallback, issue #20
+  password: ${CB_PASSWORD}                      # REQUIRED — no fallback, issue #20
+  bucket: ${CB_BUCKET:fraud-detection}
 management:
   endpoints.web.exposure.include: health,info,prometheus
   metrics.tags.service: ${spring.application.name}
@@ -110,6 +112,20 @@ logging:
 
 `acks=all` on a single-node broker with RF=1 means "the one broker has it". It is set anyway so
 the configuration is correct when the topology changes, and because it costs nothing here.
+
+### Credentials are required, not defaulted
+
+Every other environment-backed value above carries a fallback. `CB_USER`, `CB_PASSWORD` and — in
+gateway-service and mock-payment-api — `JWT_SECRET` deliberately do not. A default like `${CB_USER:Administrator}`
+means a service deployed without its credentials configured starts *anyway*, against whatever that
+default happens to reach, and reports itself healthy. For the JWT secret it is worse than weak: a
+checked-in signing key is a publicly-known one, so a gateway started without `JWT_SECRET` would
+accept tokens forged by anyone who has read this repository. Failing to start is the safe outcome
+for a missing credential.
+
+Nothing local regresses as a result. `docker-compose.yml` supplies dev values explicitly, so
+`docker compose up` remains one command with no setup step (spec §14), and the integration tests
+register `couchbase.username` / `couchbase.password` through `@DynamicPropertySource`.
 
 ## 4. Correlation ID propagation
 
