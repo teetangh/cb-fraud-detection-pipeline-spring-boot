@@ -240,6 +240,7 @@ Full symptom-first guide, including the immortal-Redis-counter bug and the stuck
 | [CONTRACTS](docs/CONTRACTS.md) | JSON Schema for every message shape. **Load-bearing** — there is no shared DTO jar |
 | [ADRs](docs/adr/) | 15 decisions, each with its naive alternative and named failure mode |
 | [TEST_PLAN](docs/TEST_PLAN.md) | T1–T10 acceptance criteria |
+| [CONFORMANCE](docs/CONFORMANCE.md) | Spec §9 and §14 audited against actual call sites, with file:line references |
 | [RUNBOOK](docs/RUNBOOK.md) | Symptom-first operations guide |
 | [INTERVIEW_PREP](docs/INTERVIEW_PREP.md) | Design walkthrough, trade-off drills, failure-mode Q&A |
 
