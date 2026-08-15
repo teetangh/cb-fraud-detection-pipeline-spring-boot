@@ -76,6 +76,31 @@ public class OutboxRepository {
         ));
     }
 
+    /**
+     * Re-reads the row by KEY and reports whether it is still PENDING.
+     *
+     * <p>KV, not N1QL, and that is the entire point: KV is immediately consistent
+     * while the GSI backing {@code findPending} lags by ~195ms. So a row the
+     * post-commit nudge has already published and marked PUBLISHED still appears
+     * PENDING to the next scheduled poll — which would republish it, producing a
+     * real duplicate on the topic rather than a delay.
+     *
+     * <p>That is not a tolerable at-least-once duplicate: enrichment's velocity
+     * counter is not idempotent under redelivery, so a systematic double-publish
+     * would double every customer's velocity count. T3 caught exactly this
+     * regression when the nudge was made fast enough to beat the index.
+     */
+    public boolean isStillPending(String outboxId) {
+        try {
+            return OutboxEvent.Status.PENDING.name().equals(
+                    outbox.lookupIn("outbox::" + outboxId,
+                                    List.of(com.couchbase.client.java.kv.LookupInSpec.get("status")))
+                          .contentAs(0, String.class));
+        } catch (com.couchbase.client.core.error.DocumentNotFoundException e) {
+            return false;
+        }
+    }
+
     /** Gauge source: should hover at ~0. A monotonic climb means Kafka is unreachable. */
     public long countPending() {
         String statement = """

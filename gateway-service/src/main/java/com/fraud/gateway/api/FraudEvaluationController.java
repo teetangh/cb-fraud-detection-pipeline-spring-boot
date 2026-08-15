@@ -2,6 +2,7 @@ package com.fraud.gateway.api;
 
 import com.fraud.gateway.domain.FraudDecisionResponse;
 import com.fraud.gateway.domain.TransactionRequest;
+import com.fraud.gateway.infra.CallerNotificationRecord;
 import com.fraud.gateway.infra.DecisionWaiter;
 import com.fraud.gateway.infra.HmacJwtVerifier;
 import com.fraud.gateway.infra.IngestionClient;
@@ -33,6 +34,7 @@ public class FraudEvaluationController {
     private final RateLimiter rateLimiter;
     private final IngestionClient ingestionClient;
     private final DecisionWaiter decisionWaiter;
+    private final CallerNotificationRecord callerRecord;
     private final Timer latencyTimer;
     private final Counter authFailedCounter;
 
@@ -40,11 +42,13 @@ public class FraudEvaluationController {
                                      RateLimiter rateLimiter,
                                      IngestionClient ingestionClient,
                                      DecisionWaiter decisionWaiter,
+                                     CallerNotificationRecord callerRecord,
                                      MeterRegistry meterRegistry) {
         this.jwtVerifier = jwtVerifier;
         this.rateLimiter = rateLimiter;
         this.ingestionClient = ingestionClient;
         this.decisionWaiter = decisionWaiter;
+        this.callerRecord = callerRecord;
         this.latencyTimer = Timer.builder("fraud.gateway.decision.latency")
                 .description("Full evaluate round trip").register(meterRegistry);
         this.authFailedCounter = Counter.builder("fraud.gateway.auth.failed").register(meterRegistry);
@@ -92,14 +96,19 @@ public class FraudEvaluationController {
                                     request.transactionId(), correlationId,
                                     () -> ingestionClient.ingest(request, correlationId),
                                     startNanos)
-                            .map(decision -> {
+                            .flatMap(decision -> {
                                 latencyTimer.record(java.time.Duration.ofMillis(decision.latencyMs()));
                                 log.info("Decision transactionId={} decision={} score={} "
                                          + "resolvedBy={} latencyMs={} correlationId={}",
                                          request.transactionId(), decision.decision(),
                                          decision.riskScore(), decision.resolvedBy(),
                                          decision.latencyMs(), correlationId);
-                                return ResponseEntity.ok(decision);
+                                // Record what we actually told the caller, so
+                                // action-audit-service only reconciles on a
+                                // GENUINE difference rather than on every
+                                // non-ALLOW decision (docs/CONTRACTS.md §9).
+                                return callerRecord.record(decision)
+                                        .thenReturn(ResponseEntity.ok(decision));
                             });
                 })
                 .onErrorResume(e -> {

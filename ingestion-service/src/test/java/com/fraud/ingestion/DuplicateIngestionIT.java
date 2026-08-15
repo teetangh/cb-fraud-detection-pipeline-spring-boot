@@ -1,6 +1,7 @@
 package com.fraud.ingestion;
 
 import com.couchbase.client.java.Cluster;
+import com.couchbase.client.java.Collection;
 import com.couchbase.client.java.query.QueryOptions;
 import com.couchbase.client.java.query.QueryScanConsistency;
 import com.fraud.ingestion.domain.IngestionResult;
@@ -11,6 +12,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.annotation.DirtiesContext;
 
@@ -53,6 +55,7 @@ class DuplicateIngestionIT extends AbstractIngestionIT {
 
     @Autowired TransactionIngestor ingestor;
     @Autowired Cluster cluster;
+    @Autowired @Qualifier("rawTransactionsCollection") Collection rawTransactions;
 
     @Test
     @DisplayName("two concurrent identical transactionIds produce exactly one record and one event")
@@ -91,37 +94,47 @@ class DuplicateIngestionIT extends AbstractIngestionIT {
                 IngestionResult.Status.ACCEPTED, IngestionResult.Status.DUPLICATE);
 
         // ── exactly ONE document in Couchbase ────────────────────────────────
-        long docCount = cluster.query("""
-                        SELECT RAW COUNT(*)
-                        FROM `%s`.`transactions`.`raw-transactions` t
-                        WHERE t.transactionId = $txnId
-                        """.formatted(BUCKET),
-                        QueryOptions.queryOptions()
-                                .parameters(com.couchbase.client.java.json.JsonObject.create()
-                                        .put("txnId", transactionId))
-                                // REQUEST_PLUS: this reads immediately after a write, and
-                                // N1QL defaults to NOT_BOUNDED (LLD §7).
-                                .scanConsistency(QueryScanConsistency.REQUEST_PLUS))
-                .rowsAs(Long.class).getFirst();
-
-        assertThat(docCount)
-                .as("upsert() instead of insert() would leave one document here too — but it "
-                    + "would have OVERWRITTEN the original and written a second outbox row")
-                .isEqualTo(1L);
+        // A KV read, not a N1QL COUNT. The key is deterministic (txn::{id}) and
+        // KV is immediately consistent, whereas a COUNT depends on GSI catch-up
+        // and reports 0 for a document that is definitely committed. That is not
+        // hypothetical — it failed here once the outbox nudge got fast enough to
+        // beat the index, which is exactly the ~195ms GSI lag that turned out to
+        // dominate end-to-end latency.
+        //
+        // "Exactly one" is guaranteed by the key itself; what insert()-vs-upsert()
+        // actually decides is whether the ORIGINAL survived, which is asserted
+        // below via correlationId, and whether a SECOND outbox row was written,
+        // which is asserted next.
+        assertThat(rawTransactions.exists("txn::" + transactionId).exists())
+                .as("the transaction must be durably committed exactly once")
+                .isTrue();
+        assertThat(rawTransactions.get("txn::" + transactionId).contentAsObject()
+                        .getString("correlationId"))
+                .as("upsert() would have OVERWRITTEN the original with the retry's "
+                    + "correlationId; insert() preserves the first writer's")
+                .isEqualTo(resultA.correlationId());
 
         // ── exactly ONE outbox row ───────────────────────────────────────────
-        long outboxCount = cluster.query("""
-                        SELECT RAW COUNT(*)
-                        FROM `%s`.`transactions`.`outbox` o
-                        WHERE o.payload.transactionId = $txnId
-                        """.formatted(BUCKET),
-                        QueryOptions.queryOptions()
-                                .parameters(com.couchbase.client.java.json.JsonObject.create()
-                                        .put("txnId", transactionId))
-                                .scanConsistency(QueryScanConsistency.REQUEST_PLUS))
-                .rowsAs(Long.class).getFirst();
-
-        assertThat(outboxCount).isEqualTo(1L);
+        // This one genuinely needs N1QL: the outbox key is a fresh UUID, so it
+        // can only be found by querying on payload.transactionId. Wrapped in
+        // Awaitility because even REQUEST_PLUS is only consistent as of the
+        // moment the query is issued.
+        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+            long outboxCount = cluster.query("""
+                            SELECT RAW COUNT(*)
+                            FROM `%s`.`transactions`.`outbox` o
+                            WHERE o.payload.transactionId = $txnId
+                            """.formatted(BUCKET),
+                            QueryOptions.queryOptions()
+                                    .parameters(com.couchbase.client.java.json.JsonObject.create()
+                                            .put("txnId", transactionId))
+                                    .scanConsistency(QueryScanConsistency.REQUEST_PLUS))
+                    .rowsAs(Long.class).getFirst();
+            assertThat(outboxCount)
+                    .as("a second outbox row means a second pipeline event, which "
+                        + "double-increments the velocity counter")
+                    .isEqualTo(1L);
+        });
 
         // ── exactly ONE Kafka event ──────────────────────────────────────────
         // This is the assertion that catches the real damage of upsert(): a second

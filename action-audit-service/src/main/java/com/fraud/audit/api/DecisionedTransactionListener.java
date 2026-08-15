@@ -3,6 +3,7 @@ package com.fraud.audit.api;
 import com.fraud.audit.domain.AuditLedgerEntry;
 import com.fraud.audit.domain.AuditLedgerEntry.AuditEventType;
 import com.fraud.audit.infra.AuditLedgerRepository;
+import com.fraud.audit.infra.CallerNotificationLookup;
 import com.fraud.audit.infra.WebhookClient;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
@@ -34,6 +35,7 @@ public class DecisionedTransactionListener {
 
     private final AuditLedgerRepository ledger;
     private final WebhookClient webhookClient;
+    private final CallerNotificationLookup callerLookup;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
     private final MeterRegistry meterRegistry;
@@ -43,6 +45,7 @@ public class DecisionedTransactionListener {
 
     public DecisionedTransactionListener(AuditLedgerRepository ledger,
                                          WebhookClient webhookClient,
+                                         CallerNotificationLookup callerLookup,
                                          KafkaTemplate<String, String> kafkaTemplate,
                                          ObjectMapper objectMapper,
                                          MeterRegistry meterRegistry,
@@ -51,6 +54,7 @@ public class DecisionedTransactionListener {
                                          @Value("${fraud.service-version:1.0.0}") String serviceVersion) {
         this.ledger = ledger;
         this.webhookClient = webhookClient;
+        this.callerLookup = callerLookup;
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
         this.meterRegistry = meterRegistry;
@@ -94,17 +98,35 @@ public class DecisionedTransactionListener {
                 publishAlert(d, transactionId, correlationId, decision);
                 actions.add(action("ALERT_RAISED", "SUCCESS", alertsTopic));
 
-                boolean delivered = webhookClient.notifyReconciliation(
-                        transactionId, correlationId,
-                        // What the caller was told when the gateway timed out.
-                        "REVIEW", decision, d.path("riskScore").asInt(),
-                        d.get("triggeredRules"), text(d, "policyVersion"));
+                // Only reconcile on a GENUINE difference. The gateway records
+                // what it actually told the caller; if that already matches the
+                // final decision there is nothing to correct, and notifying
+                // anyway would make the reconciliation metric meaningless — its
+                // whole purpose is to answer "how often did we tell a caller the
+                // wrong thing?" (docs/CONTRACTS.md §9).
+                //
+                // Unknown ⇒ notify. Over-notifying is safe (the receiver is
+                // idempotent on transactionId); under-notifying leaves a caller
+                // holding a stale REVIEW for a transaction we actually BLOCKED.
+                String previousDecision = callerLookup.whatCallerWasTold(correlationId)
+                        .orElse("REVIEW");
 
-                actions.add(action("WEBHOOK_NOTIFIED", delivered ? "SUCCESS" : "FAILED",
-                                   delivered ? "reconciled" : "delivery exhausted after 3 attempts"));
-                if (delivered) {
-                    ledger.append(entry(d, AuditEventType.ACTION_EXECUTED, decision));
-                    meterRegistry.counter("fraud.audit.reconciliation").increment();
+                if (callerLookup.needsReconciliation(correlationId, decision)) {
+                    boolean delivered = webhookClient.notifyReconciliation(
+                            transactionId, correlationId,
+                            previousDecision, decision, d.path("riskScore").asInt(),
+                            d.get("triggeredRules"), text(d, "policyVersion"));
+
+                    actions.add(action("WEBHOOK_NOTIFIED", delivered ? "SUCCESS" : "FAILED",
+                                       delivered ? "reconciled " + previousDecision + " -> " + decision
+                                                 : "delivery exhausted after 3 attempts"));
+                    if (delivered) {
+                        ledger.append(entry(d, AuditEventType.ACTION_EXECUTED, decision));
+                        meterRegistry.counter("fraud.audit.reconciliation").increment();
+                    }
+                } else {
+                    actions.add(action("WEBHOOK_NOTIFIED", "SKIPPED",
+                                       "caller already told " + decision + " — nothing to reconcile"));
                 }
             } else {
                 actions.add(action("WEBHOOK_NOTIFIED", "SKIPPED", "decision == ALLOW"));
