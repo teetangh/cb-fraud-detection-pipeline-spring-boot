@@ -148,26 +148,46 @@ And   no message is lost
 
 Spec §10 requires that it be *"actually meaningful, not just checking eventual consistency"*. A
 naive version — kill an instance, wait, assert everything eventually processed — **passes under
-`RangeAssignor` too**, because eager rebalancing also reaches eventual consistency. It would prove
-nothing about the setting it claims to verify.
+`RangeAssignor` too**, because eager rebalancing also reaches eventual consistency. It would be
+green whether or not `CooperativeStickyAssignor` was ever configured, and would prove nothing
+about the setting it claims to verify.
 
-So the test is **parameterized across both assignors**:
+So the test is **parameterized across both assignors**, and the eager run is asserted as an
+explicit *control*:
 
-| Assignor | Unaffected-partition gap | Expected result |
+| Assignor | Assertion | Result |
 |---|---|---|
-| `CooperativeStickyAssignor` | none | **PASS** |
-| `RangeAssignor` | present | **FAIL the no-gap assertion** |
+| `CooperativeStickyAssignor` | the survivor **retains** partitions nobody asked to move, and those partitions show **no processing gap** | PASS |
+| `RangeAssignor` | the **same scenario** revokes **all** of the survivor's partitions | PASS — i.e. the control fires |
 
-and asserts that the `RangeAssignor` run *does* exhibit the gap. If both configurations passed,
-the test would be a tautology and the configuration would be unverified.
+If the `RangeAssignor` case ever passed vacuously — no revocations — the two assignors would be
+behaving identically in this harness and the cooperative assertion above it would be measuring
+nothing. That is why the control is asserted rather than assumed.
 
 The gap is measured by recording a per-partition timeline of processed-message timestamps and
-looking for an interval exceeding a threshold on partitions that were never reassigned
-(determined from the `ConsumerRebalanceListener` callbacks, not guessed).
+looking for an interval exceeding a threshold on partitions the survivor kept — determined from
+`ConsumerRebalanceListener` callbacks, not guessed.
 
-**Flakiness control:** rebalance timing is inherently racy. Bounds are strict on the *unaffected*
-partitions (where the claim is "no gap at all") and generous on the *reassigned* ones (where the
-claim is only "resumes within a bounded time"), using Awaitility rather than fixed sleeps.
+### Scoping the measurement window — two harness bugs worth recording
+
+Both of these made cooperative look identical to eager, i.e. the test reported a real-looking
+problem that did not exist. In a test whose entire value is distinguishing the two assignors,
+that is the failure mode to guard against:
+
+1. **Revocations accumulated from process start**, so they included the *initial group-formation*
+   rebalance — where the first consumer legitimately hands a share of partitions to the joiner
+   under **either** assignor. The window is now scoped to the kill.
+2. **Closing a consumer fires `onPartitionsRevoked` for everything it holds**, and the list was
+   read *after* the survivor's own teardown — measuring our shutdown rather than the rebalance.
+   All 6 partitions appeared revoked under cooperative. The snapshot is now taken before shutdown.
+
+**Flakiness control:** rebalance timing is inherently racy, so the gap threshold is deliberately
+generous (2.5s). The claim under test is "no stop-the-world", not "sub-second scheduling" — a
+tight bound would add flakiness on a loaded machine without adding meaning, and the eager case
+stalls for the full rebalance, so the two are far apart.
+
+**Result:** `Tests run: 2, Failures: 0, Errors: 0` against real Kafka
+(`apache/kafka-native:4.3.1`, 6 partitions, 2 consumers, steady producer stream).
 
 ---
 
