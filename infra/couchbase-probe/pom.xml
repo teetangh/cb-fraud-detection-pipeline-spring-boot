@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Couchbase Community Edition capability probe.
+
+  This is a GATE, not a service. Spec §9.2 requires the transaction record and
+  its outbox row to be written in ONE Couchbase multi-document ACID transaction
+  via cluster.transactions().run(). That guarantee is the reason no transaction
+  can be silently lost.
+
+  Couchbase's own product-comparison page lists "Distributed ACID Transactions"
+  under Enterprise Edition. If that were true of the SDK API, the entire outbox
+  pattern would be unbuildable on the CE image this project pins, and we would
+  find out in Phase 2 after building on top of it.
+
+  The spec says CE is fine, and Couchbase's SDK engineering blog agrees —
+  transactions are implemented client-side via Active Transaction Record
+  documents, with no server-side service to license. This module proves it
+  against a real CE container instead of taking either source on faith.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.1.0</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.fraud</groupId>
+  <artifactId>couchbase-probe</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <name>couchbase-probe</name>
+  <description>Phase 1 gate: proves Couchbase CE supports multi-document ACID transactions</description>
+
+  <properties>
+    <java.version>21</java.version>
+    <couchbase.image>couchbase/server:community-7.6.2</couchbase.image>
+  </properties>
+
+  <dependencies>
+    <!-- Raw SDK only. Spring Data Couchbase does not expose multi-document
+         transactions, which is exactly what is being proven here. -->
+    <dependency>
+      <groupId>com.couchbase.client</groupId>
+      <artifactId>java-client</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- Testcontainers 2.x renamed its artifacts: the old org.testcontainers:couchbase
+         and :junit-jupiter coordinates 404 at 2.0.5. See ADR-0001. -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-couchbase</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>ch.qos.logback</groupId>
+      <artifactId>logback-classic</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Named *IT, so it runs under failsafe and CI's -DskipITs skips it.
+           A Couchbase container on a hosted runner is slow and flaky; the PR
+           agent runs this locally. See .github/AGENT_WORKFLOW.md. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

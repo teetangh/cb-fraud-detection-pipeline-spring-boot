@@ -164,3 +164,12 @@ version of each. Things already verified against the real classpath and recorded
   **`testcontainers-junit-jupiter`** — the old `kafka` / `couchbase` IDs 404
 - `CouchbaseContainer` **throws** on a CE image if `ANALYTICS` or `EVENTING` are enabled — pin
   `withEnabledServices(KV, QUERY, INDEX)`
+- **N1QL defaults to `NOT_BOUNDED` scan consistency.** A query right after a KV write returns
+  stale results — usually zero rows. Any read-after-write needs
+  `QueryOptions.scanConsistency(QueryScanConsistency.REQUEST_PLUS)`. This already broke the Phase 1
+  probe once; if a query-based test is intermittently green, check this first. See
+  [LLD §7](../docs/LLD.md#7-couchbase-query-consistency--read-after-write-is-not-free).
+- **Do not assert `plan.contains("IndexScan")`.** Couchbase picks among `IndexScan3`,
+  `IndexCountScan2`, `DistinctScan`, `IntersectScan` by query shape — a covering `COUNT` plans to
+  `IndexCountScan2`, which is a *better* plan and does not contain that substring. This also broke
+  the Phase 1 probe. Assert `doesNotContain("PrimaryScan")` plus the index name and `"using":"gsi"`.

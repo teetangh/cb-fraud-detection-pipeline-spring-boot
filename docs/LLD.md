@@ -219,7 +219,57 @@ new DefaultErrorHandler(
 - Offsets are committed for DLQ'd records. Moving a poison message aside *is* the successful
   outcome; leaving it uncommitted would block the partition permanently.
 
-## 7. Health, readiness, and startup ordering
+## 7. Couchbase query consistency — read-after-write is not free
+
+**N1QL defaults to scan consistency `NOT_BOUNDED`.** GSI indexes are maintained asynchronously, so
+a query issued immediately after a KV write legitimately returns stale results — usually zero rows.
+
+This was not theoretical: the Phase 1 CE probe failed on exactly this, inserting a document and
+counting zero a moment later.
+
+```java
+cluster.query(statement, QueryOptions.queryOptions()
+        .scanConsistency(QueryScanConsistency.REQUEST_PLUS));
+```
+
+Where it matters:
+
+| Query | Consistency | Why |
+|---|---|---|
+| scoring-service loading the ruleset (60s timer) | `NOT_BOUNDED` | Stale by up to a few seconds is fine — the refresh interval is 60s anyway. Paying for consistency on the hot path would be waste. |
+| scoring-service **force-refresh** endpoint | **`REQUEST_PLUS`** | The caller just edited a rule and is asking for it now. Stale here defeats the entire point of the endpoint. |
+| decision-service policy load | **`REQUEST_PLUS`** on force-refresh, `NOT_BOUNDED` on timer | Same reasoning. |
+| OutboxPublisher polling for `PENDING` | `NOT_BOUNDED` | A row missed on this tick is caught on the next. The 200ms timer is the retry. |
+| Any test doing read-after-write | **`REQUEST_PLUS`** | Otherwise the test is intermittently green, which is worse than red. |
+
+[T8](TEST_PLAN.md#t8) is the one that would otherwise be flaky — it edits a rule and immediately
+re-queries. A test that passes 90% of the time trains people to re-run rather than investigate.
+
+### Asserting on query plans
+
+Spec §8 requires verifying with `EXPLAIN` that queries use an index scan rather than a
+`PrimaryScan`. The obvious assertion is wrong:
+
+```java
+assertThat(plan).contains("IndexScan");     // ← brittle, fails on good plans
+```
+
+Couchbase chooses among several GSI scan operators depending on query shape — `IndexScan3`,
+`IndexCountScan2` (a covering scan for `COUNT`), `DistinctScan`, `IntersectScan`. The probe's
+`SELECT RAW COUNT(*)` plans to `IndexCountScan2`, which is an excellent plan and does not contain
+the substring `IndexScan`. The assertion failed on a covering index.
+
+Assert the actual requirement instead — *not a primary scan, and it used our index*:
+
+```java
+assertThat(plan).doesNotContain("PrimaryScan");
+assertThat(plan).contains("idx_rules_enabled").contains("\"using\":\"gsi\"");
+```
+
+This survives the planner picking a different, better operator, and still fails for the reason
+that matters.
+
+## 8. Health, readiness, and startup ordering
 
 Compose orders startup with `depends_on: condition: service_healthy`, and each service exposes a
 real readiness check rather than a liveness check pretending to be one:
@@ -235,7 +285,7 @@ collection and index creation are all asynchronous in Couchbase, and creating a 
 immediately after its scope fails if the cluster has not caught up. Every step retries with
 backoff and tolerates "already exists".
 
-## 8. Resource footprint
+## 9. Resource footprint
 
 Sized to fit a constrained machine (see [ADR-0013](adr/0013-couchbase-ce-single-node-kraft.md)).
 
@@ -253,10 +303,26 @@ the wrong one in production. It is set via an env var so it can be removed witho
 **latency measurements should be taken with it off**, or the p99 numbers describe the JIT setting
 rather than the design.
 
-Compose profiles: `infra` (Kafka/Redis/Couchbase + init), `core` (infra + ingestion path),
-`full` (everything).
+### Subsetting the stack — why not compose profiles
 
-## 9. Docker build
+Spec §14 requires that a bare `docker compose up` bring up the whole stack with no manual steps.
+Compose profiles work against that: a service assigned to a profile is *excluded* from a bare
+`up`, so putting the services behind a `full` profile would mean the documented one-command start
+no longer starts anything.
+
+So nothing is profiled, and subsets are selected by naming services instead —
+`depends_on` pulls in what they need:
+
+```bash
+docker compose up -d                            # everything (spec §14)
+docker compose up -d kafka-init couchbase-init  # infra only; pulls kafka, couchbase, redis
+```
+
+`scripts/preflight.sh [infra|core|full]` checks resources and host ports against the same three
+tiers before anything starts. Host ports are overridable via `.env` (see `.env.example`) — the
+Couchbase console's 8091 in particular collides with a number of other local dev tools.
+
+## 10. Docker build
 
 Multi-stage, with a BuildKit cache mount so Maven downloads once across all seven builds rather
 than seven times:
@@ -285,7 +351,7 @@ layer, so the marginal cost per service is the ~40 MB jar, not a fresh JRE.
 Tests are skipped in the image build and run separately via `./mvnw verify` — integration tests
 need a Docker socket, and building images inside the image build is not a road worth going down.
 
-## 10. Testing strategy
+## 11. Testing strategy
 
 | Level | Tool | Scope |
 |---|---|---|

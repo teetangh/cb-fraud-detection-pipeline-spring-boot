@@ -80,16 +80,40 @@ consumer is a tolerant reader. → [ADR-0002](docs/adr/0002-no-shared-dto-jar.md
 ## Quick start
 
 **Requirements:** Docker + Compose v2, Java 21, ~4.6 GB free RAM, ~4 GB free disk.
-Maven is *not* required — each service ships a script-only Maven Wrapper.
+Maven is *not* required — each module ships a script-only Maven Wrapper (`./mvnw`), so nothing
+needs installing and nothing needs sudo.
 
 ```bash
-./scripts/preflight.sh        # checks RAM + disk, fails loudly rather than mid-build
-docker compose up -d          # infra, init jobs, then all 7 services
+./scripts/preflight.sh        # checks RAM, disk and host ports; fails loudly rather than mid-build
+docker compose up -d          # infra + init jobs today (Phase 1); brings up all 7 services once later phases land
 ./scripts/smoke-test.sh       # exercises every scenario, prints PASS/FAIL per scenario
 ```
 
+**Right now (Phase 1)** `docker compose up -d` brings up Kafka, Redis, Couchbase and the two init
+jobs — five containers. The seven application services join `docker-compose.yml` as their phases
+land; `smoke-test.sh` needs them to be present to do anything useful.
+
 Init containers create the 9 Kafka topics, the Couchbase bucket / 3 scopes / 7 collections, the
 N1QL indexes and the 8 seed rules automatically. There are no manual setup steps.
+
+**If preflight reports a port conflict** — most commonly because you already run Couchbase Server
+natively, which owns 8091/8093/11210 — copy `.env.example` to `.env` and change the host ports.
+Only host-side mappings move; service-to-service traffic inside the compose network is unaffected.
+
+```bash
+cp .env.example .env          # then edit CB_UI_PORT / CB_QUERY_PORT / CB_KV_PORT
+```
+
+Subsets, since the full stack is heavy:
+
+```bash
+docker compose up -d redis kafka-init couchbase-init   # infra only
+```
+
+`depends_on` pulls Kafka and Couchbase in behind their init jobs; Redis has no dependent at this
+stage, so it is named explicitly. Compose profiles are deliberately not used — a profiled service
+is excluded from a bare `docker compose up`, which would break the one-command start spec §14
+requires.
 
 ### Try it by hand
 
@@ -225,8 +249,19 @@ load-bearing class verified present *before* any code was written.
 which the entire outbox pattern depends on. Couchbase's product-comparison page lists distributed
 transactions as Enterprise, which would invalidate it. The spec is right and the page is
 misleading — SDK transactions are implemented client-side via ATR documents, with no server-side
-service to license. Because the cost of being wrong is high and discovered late, Phase 1 gates on
-a real transaction commit against the CE container before the outbox is built.
+service to license.
+
+Because the cost of being wrong is high and discovered late, this was **not taken on faith**.
+`infra/couchbase-probe` runs against a real CE container and is a Phase 1 gate — the outbox was not
+built until it was green. It verifies, all 6 green:
+
+- multi-document ACID transaction commits both documents
+- a failed transaction **rolls back both** (a commit-only test would pass on a system with no
+  transaction support at all, since two sequential inserts also leave both documents present)
+- `insert()` throws on a duplicate key and does not overwrite
+- the Binary Collection counter is exact under 20 concurrent writers × 50 increments
+- N1QL + GSI index creation work, and the plan uses the index rather than a primary scan
+
 → [ADR-0013](docs/adr/0013-couchbase-ce-single-node-kraft.md)
 
 ---
@@ -270,7 +305,7 @@ Built in the phase order of spec §12, each phase gated on its acceptance tests.
 | Phase | Scope | Exit criteria | Status |
 |---|---|---|---|
 | — | Design, contracts, ADRs, backlog | — | ✅ Done |
-| 1 | Infra skeleton + init jobs | Topics, bucket, seed rules, **CE transaction probe** | ⬜ |
+| 1 | Infra skeleton + init jobs | Topics, bucket, seed rules, **CE transaction probe** | ✅ Done |
 | 2 | Ingestion path + outbox | T3, T4 | ⬜ |
 | 3 | Enrichment + scoring | T2, T8, Lua concurrency | ⬜ |
 | 4 | Decision + sync facade | T1, T6, T7a | ⬜ |

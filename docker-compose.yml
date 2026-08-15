@@ -1,0 +1,188 @@
+# Real-time fraud detection pipeline — local stack.
+#
+# `docker compose up` brings up everything with no manual steps (spec §14).
+# The two init containers run to completion and exit 0 before anything that
+# depends on them starts.
+#
+# Infra only (Phase 1 scope):
+#     docker compose up -d kafka-init couchbase-init
+#   depends_on pulls kafka, couchbase and redis up with it.
+#
+# Deliberately NOT using compose profiles: profiled services are excluded from a
+# bare `docker compose up`, which would break the spec §14 requirement that one
+# command brings up the whole stack. Naming services gives the same subsetting
+# without that cost.
+#
+# Memory limits are tuned for a constrained machine (~4.6 GB for the full
+# stack). See docs/LLD.md §8 — and run scripts/preflight.sh first.
+
+name: fraud-detection
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 5s
+  timeout: 5s
+  retries: 30
+  start_period: 10s
+
+services:
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Kafka — single KRaft node, broker + controller in one process, RF=1.
+  # A 3-broker local cluster is deliberately NOT built: the replicas would
+  # share one disk and one failure domain, so it would test nothing that RF=1
+  # does not while appearing to test replication. See ADR-0013.
+  # ────────────────────────────────────────────────────────────────────────
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: fraud-kafka
+    hostname: kafka
+    ports:
+      # Host ports are configurable via .env — see .env.example. Defaults collide
+      # with anything else already using them (Couchbase's 8091 in particular is
+      # a common squatter), and scripts/preflight.sh fails loudly when they do.
+      - "${KAFKA_HOST_PORT:-29092}:29092"   # host access; in-network clients use kafka:9092
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # RF=1 on the internal topics too. The defaults are 3, which a single
+      # broker cannot satisfy — it fails to create __consumer_offsets and the
+      # broker never becomes usable. This is the most common single-node
+      # Kafka startup failure.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # topics come from kafka-init, with deliberate partition counts
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms256m
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      <<: *healthcheck-defaults
+    mem_limit: 900m
+    networks: [fraud-net]
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Redis — ephemeral, TTL-bounded working state only. Velocity windows,
+  # geo/device sets, idempotency cache, rate limits, and the decision Pub/Sub
+  # channel. Durable aggregates live in Couchbase (ADR-0015).
+  #
+  # allkeys-lru is safe here precisely because nothing in Redis is a system of
+  # record — losing a key costs one TTL window of detection quality, never
+  # correctness. That is why lifetime_txn_count is NOT here.
+  # ────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4.10-alpine
+    container_name: fraud-redis
+    hostname: redis
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    command: >
+      redis-server
+      --maxmemory 64mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *healthcheck-defaults
+    mem_limit: 128m
+    networks: [fraud-net]
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Couchbase Server 7.6 Community Edition.
+  # Transactions, N1QL, GSI indexes and the Binary Collection counter API are
+  # all available in CE and all used (spec §3). CE limits that do not bind
+  # locally: 4 cores/node, 5-node cluster, no XDCR, no index replicas.
+  # ────────────────────────────────────────────────────────────────────────
+  couchbase:
+    image: couchbase/server:community-7.6.2
+    container_name: fraud-couchbase
+    hostname: couchbase
+    ports:
+      - "${CB_UI_PORT:-8091}:8091"       # web console
+      - "${CB_QUERY_PORT:-8093}:8093"    # N1QL query service
+      - "${CB_KV_PORT:-11210}:11210"     # KV
+    volumes:
+      - couchbase-data:/opt/couchbase/var
+    healthcheck:
+      # Accept 200 OR 401 — the check is "is the REST API answering", not "does
+      # it return 200".
+      #
+      # /pools returns 200 anonymously on a FRESH node and 401 once the cluster
+      # has been initialised. A naive `curl -sf` treats 401 as failure, so the
+      # healthcheck passes on first boot, couchbase-init runs, and from that
+      # moment on the container is permanently unhealthy — meaning every later
+      # `docker compose up` refuses to start anything that depends_on it. That
+      # is exactly what happened here before this fix, and it only appears on
+      # the SECOND run, which is the worst kind of bug to ship.
+      #
+      # 401 is a perfectly good liveness signal: something authenticated the
+      # request, so the API is serving. couchbase-init does its own readiness
+      # waiting for the cluster, bucket and query service in turn.
+      test:
+        - CMD-SHELL
+        - >-
+          code=$$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8091/pools);
+          [ "$$code" = "200" ] || [ "$$code" = "401" ]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    mem_limit: 1500m
+    ulimits:
+      nofile: {soft: 40960, hard: 40960}
+    networks: [fraud-net]
+
+  # ────────────────────────────────────────────────────────────────────────
+  # One-shot init jobs. Both are idempotent and safe to re-run.
+  # ────────────────────────────────────────────────────────────────────────
+  kafka-init:
+    image: apache/kafka:4.3.1
+    container_name: fraud-kafka-init
+    depends_on:
+      kafka: {condition: service_healthy}
+    volumes:
+      - ./infra/kafka-init:/init:ro
+    entrypoint: ["/bin/bash", "/init/create-topics.sh"]
+    environment:
+      BOOTSTRAP: kafka:9092
+    restart: "no"
+    networks: [fraud-net]
+
+  couchbase-init:
+    image: couchbase/server:community-7.6.2
+    container_name: fraud-couchbase-init
+    depends_on:
+      couchbase: {condition: service_healthy}
+    volumes:
+      - ./infra/couchbase-init:/init:ro
+    entrypoint: ["/bin/bash", "/init/init.sh"]
+    environment:
+      CB_HOST: couchbase
+      CB_USER: ${CB_USER:-Administrator}
+      CB_PASSWORD: ${CB_PASSWORD:-password}
+      CB_BUCKET: ${CB_BUCKET:-fraud-detection}
+      # Raising these needs a matching bump to the couchbase mem_limit above,
+      # or the container is OOM-killed during startup.
+      CB_RAM_DATA: ${CB_RAM_DATA:-512}
+      CB_RAM_INDEX: ${CB_RAM_INDEX:-256}
+    restart: "no"
+    networks: [fraud-net]
+
+volumes:
+  kafka-data:
+  couchbase-data:
+
+networks:
+  fraud-net:
+    name: fraud-net
+    driver: bridge

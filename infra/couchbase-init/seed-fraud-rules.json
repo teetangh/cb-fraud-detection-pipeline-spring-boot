@@ -1,0 +1,98 @@
+[
+  {
+    "docType": "FRAUD_RULE",
+    "ruleId": "VELOCITY_1M",
+    "description": "More than 5 transactions by this customer in the last 60 seconds",
+    "signalKey": "velocity_1m",
+    "operator": "GREATER_THAN",
+    "threshold": 5,
+    "weight": 30,
+    "enabled": true,
+    "category": "VELOCITY",
+    "version": 1
+  },
+  {
+    "docType": "FRAUD_RULE",
+    "ruleId": "VELOCITY_1H",
+    "description": "More than 20 transactions by this customer in the last hour",
+    "signalKey": "velocity_1h",
+    "operator": "GREATER_THAN",
+    "threshold": 20,
+    "weight": 20,
+    "enabled": true,
+    "category": "VELOCITY",
+    "version": 1
+  },
+  {
+    "docType": "FRAUD_RULE",
+    "ruleId": "GEO_ANOMALY",
+    "description": "Transactions from more than one country in a 24 hour window",
+    "signalKey": "distinct_countries_24h",
+    "operator": "GREATER_THAN",
+    "threshold": 1,
+    "weight": 25,
+    "enabled": true,
+    "category": "GEO",
+    "version": 1
+  },
+  {
+    "docType": "FRAUD_RULE",
+    "ruleId": "DEVICE_SHARED",
+    "description": "More than 3 distinct customers seen on this device",
+    "signalKey": "customers_per_device",
+    "operator": "GREATER_THAN",
+    "threshold": 3,
+    "weight": 20,
+    "enabled": true,
+    "category": "DEVICE",
+    "version": 1
+  },
+  {
+    "docType": "FRAUD_RULE",
+    "ruleId": "NEW_DEVICE_HIGH_AMOUNT",
+    "description": "First time this device has been seen for this customer, on a high-value transaction",
+    "signalKey": "is_new_device_high_amt",
+    "operator": "BOOLEAN_TRUE",
+    "threshold": null,
+    "weight": 25,
+    "enabled": true,
+    "category": "DEVICE",
+    "version": 1
+  },
+  {
+    "docType": "FRAUD_RULE",
+    "ruleId": "OFF_HOURS_LARGE_TXN",
+    "description": "Large transaction between 00:00 and 05:00 UTC",
+    "signalKey": "is_off_hours_large",
+    "operator": "BOOLEAN_TRUE",
+    "threshold": null,
+    "weight": 15,
+    "enabled": true,
+    "category": "TIME",
+    "version": 1
+  },
+  {
+    "docType": "FRAUD_RULE",
+    "ruleId": "HIGH_RISK_MCC",
+    "description": "Merchant category code carries a risk score above 80",
+    "signalKey": "merchant_risk_score",
+    "operator": "GREATER_THAN",
+    "threshold": 80,
+    "weight": 20,
+    "enabled": true,
+    "category": "MERCHANT",
+    "version": 1
+  },
+  {
+    "docType": "FRAUD_RULE",
+    "ruleId": "AMOUNT_DEVIATION",
+    "description": "Amount more than 3x the customer's p90 historical amount. Neutral until the customer has at least 10 transactions - p90 over a handful of transactions is noise (ADR-0015).",
+    "signalKey": "amount_vs_p90_ratio",
+    "operator": "GREATER_THAN",
+    "threshold": 3.0,
+    "weight": 20,
+    "enabled": true,
+    "category": "AMOUNT",
+    "version": 1
+  }
+]

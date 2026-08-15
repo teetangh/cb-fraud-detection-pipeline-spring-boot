@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Testcontainers' docker-java client logs the full HTTP wire protocol at DEBUG,
+  which buries the actual test result under thousands of lines of image-pull
+  chatter. Anyone reading this log is trying to answer one question — did the
+  gate pass — so keep the signal visible.
+-->
+<configuration>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level %logger{28} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+
+  <!-- Wire-level noise -->
+  <logger name="com.github.dockerjava" level="WARN"/>
+  <logger name="org.apache.hc" level="WARN"/>
+
+  <!-- Keep container lifecycle: which image, startup time, why a wait failed -->
+  <logger name="org.testcontainers" level="INFO"/>
+  <logger name="tc" level="INFO"/>
+
+  <!-- The SDK is chatty about config on connect -->
+  <logger name="com.couchbase.client" level="WARN"/>
+  <logger name="com.couchbase.core" level="WARN"/>
+</configuration>
