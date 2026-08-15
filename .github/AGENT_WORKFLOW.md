@@ -87,7 +87,39 @@ Judge each comment against the authority order in step 1, then:
 A CodeRabbit comment is evidence, not an instruction. Where it contradicts a merged ADR, the ADR
 wins — and you say so on the thread rather than just declining.
 
-#### Waiting for it, without stalling
+#### The PR agent does NOT wait for CodeRabbit. The implementer resolves it first.
+
+**This is the rule. The rest of this section is background.**
+
+Four PR agents in a row stalled waiting on CodeRabbit — through three successive
+tightenings of the *instructions*, including an explicit "hard bound: 20 minutes". Every one of
+them sat in a monitor loop instead. The conclusion is not that the instruction needed better
+wording: **an agent given a thing to wait for will wait, and no amount of prose fixes that.** So
+the wait is removed from the agent's job entirely.
+
+**Implementer**, after opening the PR and before spawning the agent, resolve CodeRabbit to one of
+three verdicts and pass it in the agent's prompt:
+
+| Verdict | How you know | What the agent is told |
+|---|---|---|
+| **REVIEWED — findings** | check `SUCCESS`, inline comments > 0 | the comment IDs, to triage and reply on-thread |
+| **REVIEWED — clean** | check `SUCCESS`, `"Actionable comments posted: 0"` | "CodeRabbit reviewed and found nothing" |
+| **DECLINED** | check `SUCCESS` **but** body says `rate limited` / `review available in` | "CodeRabbit declined; you are the only review; say so on the PR" |
+
+```bash
+gh pr view <N> --json statusCheckRollup --jq '.statusCheckRollup[]|select(.name=="CodeRabbit")|.conclusion'
+gh pr view <N> --json comments --jq '.comments[]|select(.author.login=="coderabbitai")|.body' \
+  | grep -iE "rate limit|review available in|Actionable comments posted"
+gh api repos/{owner}/{repo}/pulls/<N>/comments --jq 'length'
+```
+
+If CodeRabbit is still `PENDING` when the implementer needs to move on, that is a **DECLINED**
+verdict for this PR. Record it, do not block the pipeline on a third-party free tier.
+
+The agent's brief must say, in as many words: **do not poll CodeRabbit, do not start a monitor for
+it, the verdict below is final for this PR.**
+
+#### Background: why the check alone is not enough
 
 **Poll the check, not the comment list.** An empty comment list means "not posted yet" and
 "nothing to say" *identically* — you cannot tell them apart, and treating the second as the first

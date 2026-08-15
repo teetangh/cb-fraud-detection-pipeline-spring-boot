@@ -35,18 +35,4 @@ public record FraudDecisionResponse(
 
     public record TriggeredRule(String ruleId, int contribution, Object actualValue, Object threshold) {}
 
-    /**
-     * The Phase 2b placeholder. Until the Redis Pub/Sub wait lands in Phase 4b
-     * there is no decision to report, so the gateway is explicit about that
-     * rather than inventing an ALLOW — inventing one would be the exact
-     * fail-wide-open behaviour ADR-0004 exists to prevent, and it would be
-     * indistinguishable from a real ALLOW in the logs.
-     */
-    public static FraudDecisionResponse pendingPipeline(String transactionId,
-                                                        String correlationId,
-                                                        long latencyMs) {
-        return new FraudDecisionResponse(transactionId, correlationId,
-                Decision.REVIEW, 0, List.of(), "pending",
-                DecisionSource.TIMEOUT_DEFAULT, latencyMs);
-    }
 }
