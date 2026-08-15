@@ -1,0 +1,112 @@
+name: CI
+
+# Fast gate only: compile + unit tests. Integration tests (*IT) need real Kafka,
+# Redis and Couchbase containers and are run locally by the PR agent, not here.
+# CI green is necessary, not sufficient — see .github/AGENT_WORKFLOW.md.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    name: Discover service modules
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.find.outputs.services }}
+      count: ${{ steps.find.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        # Any directory with a pom.xml is a buildable module. maxdepth 3 so
+        # infra/couchbase-probe/ is picked up alongside the top-level services.
+        # Emitted as a JSON array for the matrix; handles the zero-services
+        # case, which is what the early phases look like.
+        run: |
+          services=$(find . -mindepth 2 -maxdepth 3 -name pom.xml \
+                       -not -path './.git/*' -not -path '*/target/*' \
+                     | sed 's|^\./||; s|/pom.xml$||' \
+                     | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "services=$services"        >> "$GITHUB_OUTPUT"
+          echo "count=$(jq -r 'length' <<< "$services")" >> "$GITHUB_OUTPUT"
+          echo "Discovered: $services"
+
+  build:
+    name: build ${{ matrix.service }}
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.discover.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Compile and run unit tests
+        working-directory: ${{ matrix.service }}
+        # -DskipITs skips failsafe (*IT). Surefire (*Test) still runs.
+        run: mvn -B -ntp verify -DskipITs
+
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-${{ matrix.service }}
+          path: ${{ matrix.service }}/target/surefire-reports/
+          if-no-files-found: ignore
+
+  shellcheck:
+    name: Lint shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        # Init scripts create Couchbase scopes/collections and Kafka topics.
+        # A quoting bug there fails at container start, which is a slow and
+        # confusing way to find out.
+        run: |
+          shopt -s nullglob globstar
+          files=(scripts/**/*.sh infra/**/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then echo "No shell scripts yet."; exit 0; fi
+          printf 'Checking: %s\n' "${files[@]}"
+          shellcheck -S warning "${files[@]}"
+
+  docs:
+    name: Check doc links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify internal markdown links resolve
+        # There is no shared DTO jar, so docs/CONTRACTS.md IS the inter-service
+        # contract. A dead link into it is a real defect, not a typo.
+        run: |
+          broken=0
+          while IFS= read -r f; do
+            d=$(dirname "$f")
+            while IFS= read -r link; do
+              case "$link" in http*|\#*|../../issues*|mailto:*) continue ;; esac
+              target="${link%%#*}"
+              [ -z "$target" ] && continue
+              if [ ! -e "$d/$target" ]; then
+                echo "BROKEN: $f -> $link"
+                broken=1
+              fi
+            done < <(grep -oP '\]\(\K[^)]+' "$f" 2>/dev/null || true)
+          done < <(find . -name '*.md' -not -path './.git/*')
+          exit $broken
