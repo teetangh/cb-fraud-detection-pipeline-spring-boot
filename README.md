@@ -335,7 +335,6 @@ in-memory fakes.
 | | |
 |---|---|
 | [#9](../../issues/9) | No circuit breaker on gateway → ingestion. The *slow* case, not the dead one, is what hurts. |
-| [#12](../../issues/12) | Residual outbox double-publish window on ack-timeout. Needs a CAS claim + a dedup key consumed by enrichment. |
 | [#24](../../issues/24) | `enrichment-service` was once observed `healthy` while absent from its consumer group. Unreproduced; a restart cleared it. |
 
 **T1–T10 all pass**, against the real Compose stack — not only against Testcontainers.

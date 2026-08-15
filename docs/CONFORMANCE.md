@@ -38,7 +38,7 @@ database guard that holds even when Redis is missed entirely.
 | **Authoritative** | `TransactionIngestor:143` | `ctx.insert(...)` — throws `DocumentExistsException` on a duplicate key |
 
 `upsert()` appears **nowhere** in any authoritative write path. The only `replace` in the
-codebase is `OutboxRepository:74`, transitioning an outbox row `PENDING → PUBLISHED`, which is a
+codebase is `OutboxRepository:85`, transitioning an outbox row `PENDING → PUBLISHED`, which is a
 deliberate state transition on a different document — not an overwrite of a transaction record.
 
 Verified by **T3**: two concurrent identical requests produce exactly one document, exactly one
@@ -60,12 +60,19 @@ this API ([ADR-0005](adr/0005-transactional-outbox.md), `CouchbaseConfig:14`).
 Ordering on the publish side is the part that actually matters:
 
 ```java
-producer.send(...).get(ACK_TIMEOUT_SECONDS, TimeUnit.SECONDS);   // OutboxPublisher:271
-outboxRepository.markPublished(event.outboxId(), Instant.now()); // OutboxPublisher:274
+outboxRepository.claim(event.outboxId(), CLAIM_STALE_AFTER);     // OutboxPublisher:237, :323
+producer.send(...).get(ACK_TIMEOUT_SECONDS, TimeUnit.SECONDS);   // OutboxPublisher:341
+outboxRepository.markPublished(event.outboxId(), Instant.now()); // OutboxPublisher:344
 ```
 
 `markPublished` is strictly *after* the broker ack. A crash between the two leaves the row
 `PENDING` and it is republished — at-least-once, never at-most-once.
+
+Both publish paths — the scheduled poll (`:237`) and the post-commit nudge (`:323`) — take the
+CAS-guarded claim first, so exactly one of them sends a given row (`OutboxRepository:128`). A
+re-read that merely *checked* the status was not enough: both paths can truthfully observe `PENDING`
+because neither has acked yet. Verified by `OutboxClaimIT`, and negative-tested — with the CAS
+removed, all 32 concurrent claimants win.
 
 Verified by **T4**: crash between commit and publish → the record stays `PENDING`, and restart
 republishes it.
@@ -196,8 +203,10 @@ decision.
 
 - It verifies the requirements are **implemented**; it does not claim the system is
   production-ready. The tracked gaps ([#9](../../issues/9) circuit breaker,
-  [#12](../../issues/12) outbox duplicate window, [#24](../../issues/24) consumer-group dropout
-  detection) are real and remain open.
+  [#24](../../issues/24) consumer-group dropout detection) are real and remain open. The
+  systematic outbox double-publish ([#12](../../issues/12)) is closed by the CAS claim above;
+  the ordinary at-least-once duplicate on an ack timeout remains, and is accepted
+  ([ADR-0005](adr/0005-transactional-outbox.md)).
 - Single-node Kafka at RF=1 and Couchbase CE single-node are development topologies. The
   multi-broker design is written up but not provisioned ([#5](../../issues/5)).
 - Auth is HMAC-shared-secret, a deliberate simplification the spec permits (§13); a real
