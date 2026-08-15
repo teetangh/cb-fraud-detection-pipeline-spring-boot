@@ -1,0 +1,89 @@
+spring:
+  application:
+    name: enrichment-service
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # Short, so a hung Redis costs a few milliseconds and degrades the signal
+      # rather than eating the caller's 150ms budget (ADR-0014).
+      timeout: 200ms
+      connect-timeout: 200ms
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+    consumer:
+      group-id: ${KAFKA_GROUP:fraud-enrichment-group}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # NEVER auto-commit (§9.6). Auto-commit fires on a wall-clock timer,
+      # decoupled from whether the work succeeded — a crash between the commit
+      # and the downstream publish loses the message SILENTLY rather than
+      # redelivering it.
+      enable-auto-commit: false
+      properties:
+        # Explicit, on every consumer group (§9.5). With the default eager
+        # assignor ANY rebalance revokes ALL partitions from ALL members — the
+        # whole group stops, including partitions nobody was going to move.
+        # ALL members must agree: a mixed group falls back to eager, so one
+        # misconfigured instance degrades the entire group.
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+    listener:
+      ack-mode: MANUAL_IMMEDIATE
+      concurrency: ${KAFKA_CONCURRENCY:3}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        delivery.timeout.ms: 4000
+        request.timeout.ms: 2000
+
+couchbase:
+  connection-string: ${CB_CONNECTION:couchbase://localhost}
+  username: ${CB_USER:Administrator}
+  password: ${CB_PASSWORD:password}
+  bucket: ${CB_BUCKET:fraud-detection}
+
+fraud:
+  topics:
+    raw: fraud.transactions.raw
+    enriched: fraud.transactions.enriched
+  signals:
+    high-amount-threshold: 10000
+    off-hours-amount-threshold: 50000
+    off-hours-start-utc: 0
+    off-hours-end-utc: 5
+
+enrichment:
+  # amount_vs_p90_ratio stays neutral below this many lifetime transactions.
+  # p90 over a handful of transactions is noise, and AMOUNT_DEVIATION would fire
+  # on every new customer's slightly larger second purchase (ADR-0015).
+  p90-min-history: 10
+
+server:
+  port: 8083
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      service: ${spring.application.name}
+
+logging:
+  structured:
+    format:
+      console: ecs
+  level:
+    com.fraud.enrichment: INFO
+    com.couchbase.client: WARN
