@@ -6,11 +6,10 @@ completes, within a hard 150ms budget — over a fully asynchronous Kafka backbo
 Everything runs locally on real infrastructure: real Kafka, real Redis, real Couchbase. No
 in-memory fakes, no cloud dependency, one `docker compose up`.
 
-> **Status: all seven services built, and T10 passes 18/18 against the live stack. Measured warm end-to-end latency: p50 30ms, max 32ms — inside the 150ms budget. T5 remains.**
-> Phase 1 (infra + the Couchbase CE capability gate) and Phase 2a (`ingestion-service`, with
-> **T3 and T4 passing** against real Kafka/Redis/Couchbase) are done. Implementation follows the
-> phase order in [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt) — see
-> [Build status](#build-status) for exactly what is and is not built.
+> **Status: all seven services built. T1–T10 all pass, including T10 at 18/18 against the live
+> 10-container stack. Measured warm end-to-end latency: p50 30ms, max 32ms — inside the 150ms
+> budget.** Built in the phase order of [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt); see
+> [Build status](#build-status) for the per-phase record and the gaps still tracked as issues.
 
 ---
 
@@ -325,7 +324,7 @@ Built in the phase order of spec §12, each phase gated on its acceptance tests.
 | 4 | `decision-service` + the sync facade | **sync-facade 4/4, 12 gateway, 11 policy** | [#17](../../pull/17) | ✅ |
 | 5 | `action-audit-service` + reconciliation | **T9 3/3** | [#18](../../pull/18) | ✅ |
 | — | **T10 full-stack smoke** | **18/18 against the live 10-container stack** | — | ✅ |
-| 6 | Cooperative rebalance proof | **T5** | — | ⬜ |
+| 6 | Cooperative rebalance proof | **T5 2/2 — cooperative retains + eager demonstrably stalls** | [#23](../../pull/23) | ✅ |
 
 **All 7 services built**, every one verified against real Kafka / Redis / Couchbase — never
 in-memory fakes.
@@ -337,9 +336,9 @@ in-memory fakes.
 | [#9](../../issues/9) | No circuit breaker on gateway → ingestion. The *slow* case, not the dead one, is what hurts. |
 | [#12](../../issues/12) | Residual outbox double-publish window on ack-timeout. Needs a CAS claim + a dedup key consumed by enrichment. |
 | [#14](../../issues/14) | `mock-payment-api` has no tests. It is a stub, but that should be a decision rather than an omission. |
-| — | T5 (cooperative rebalance) is the last unbuilt acceptance test. |
+| [#24](../../issues/24) | `enrichment-service` was once observed `healthy` while absent from its consumer group. Unreproduced; a restart cleared it. |
 
-Not "done" until T1–T10 pass against the real Compose stack, not only against Testcontainers.
+**T1–T10 all pass**, against the real Compose stack — not only against Testcontainers.
 
 ---
 
