@@ -5,7 +5,10 @@ spring:
 fraud:
   jwt:
     # Same shared secret the gateway verifies with — spec §13's simplification.
-    secret: ${JWT_SECRET:local-dev-only-not-a-real-secret-change-me}
+    # REQUIRED, no fallback (issue #20). A checked-in default secret is a
+    # publicly-known signing key: a gateway deployed without JWT_SECRET set would
+    # happily accept tokens forged by anyone who has read this repository.
+    secret: ${JWT_SECRET}
   gateway:
     base-url: ${GATEWAY_URL:http://localhost:8081}
     connect-timeout-ms: 500

@@ -41,10 +41,19 @@ spring:
         delivery.timeout.ms: 4000
         request.timeout.ms: 2000
 
+# Credentials are intentionally REQUIRED, with no fallback (issue #20).
+#
+# A default like ${CB_USER:Administrator} means a service deployed without its
+# credentials configured starts anyway, against whatever those defaults happen to
+# reach — and reports itself healthy while doing it. Failing to start is the safe
+# outcome for a missing credential; a silent fallback is not.
+#
+# docker-compose.yml supplies these explicitly, so `docker compose up` is
+# unaffected, and integration tests register them via @DynamicPropertySource.
 couchbase:
   connection-string: ${CB_CONNECTION:couchbase://localhost}
-  username: ${CB_USER:Administrator}
-  password: ${CB_PASSWORD:password}
+  username: ${CB_USER}
+  password: ${CB_PASSWORD}
   bucket: ${CB_BUCKET:fraud-detection}
 
 fraud:
