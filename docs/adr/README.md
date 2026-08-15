@@ -21,3 +21,4 @@ not a decision, it is a preference.
 | [0012](0012-customer-id-partition-key.md) | `customerId` as partition key | Velocity correctness |
 | [0013](0013-couchbase-ce-single-node-kraft.md) | Couchbase CE + single-node KRaft locally | Honest local topology |
 | [0014](0014-redis-fail-open.md) | Redis outage fails open, signals omitted not zeroed | Availability trade |
+| [0015](0015-two-stores-counter-split.md) | Why two stores, and which counters live where | Redis vs Couchbase boundary |

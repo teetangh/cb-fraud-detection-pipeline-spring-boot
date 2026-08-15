@@ -68,7 +68,30 @@ sequenceDiagram
 | `is_new_device_high_amt` | Redis + txn | `known_device.lua` on `device:known:{customerId}` **AND** `amount > 10000` |
 | `is_off_hours_large` | txn only | hour ∈ [00:00,05:00) UTC **AND** `amount > 50000` |
 | `merchant_risk_score` | Couchbase | `mcc::{merchantCategoryCode}` |
-| `amount_vs_p90_ratio` | Couchbase | `amount ÷ profile::{customerId}.p90Amount`, `1.0` if no history |
+| `lifetime_txn_count` | Couchbase **binary counter** | `binary().increment("counter::txn::{customerId}", initial(1))` — durable, no expiry |
+| `amount_vs_p90_ratio` | Couchbase | `amount ÷ profile::{customerId}.p90Amount`, **neutral `1.0` unless `lifetime_txn_count >= 10`** |
+
+### The durable counter, and why it is not in Redis
+
+```java
+long lifetime = collection.binary()
+    .increment("counter::txn::" + txn.customerId(),
+               IncrementOptions.incrementOptions().delta(1).initial(1))
+    .content();                                    // no expiry — this one is permanent
+```
+
+`increment` with `initial` is atomic and sets the starting value on creation in one operation — the
+Couchbase-native equivalent of what `velocity.lua` does for the ephemeral windows.
+
+It lives in Couchbase rather than Redis because **losing it silently produces a wrong answer**.
+Redis runs `maxmemory-policy allkeys-lru`, so under pressure a lifetime counter would be evicted,
+reset to zero, and re-enable the `AMOUNT_DEVIATION` false positive that the history gate exists to
+prevent — with `signalsDegraded` **unset**, because Redis was up, it just forgot. A silent wrong
+answer is worse than a loud missing one. → [ADR-0015](../adr/0015-two-stores-counter-split.md)
+
+Binary counters cannot participate in `cluster.transactions().run(...)`, which is why this
+increment happens here alongside the other signals rather than inside ingestion's ACID
+transaction.
 
 **The counters include the current transaction.** `velocity.lua` increments before returning, so
 the 6th transaction in a minute reads `velocity_1m = 6`. That is what makes

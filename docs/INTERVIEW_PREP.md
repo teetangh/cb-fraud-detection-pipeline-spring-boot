@@ -210,6 +210,45 @@ The most subtle point in the design and a genuine differentiator:
 > is carried onto the decision and into the ledger. The test asserts the key is **absent**, not
 > that it's zero — otherwise it'd pass on the implementation I'm rejecting."
 
+### "You already have Couchbase. Why also run Redis?"
+
+A fair attack, and "Redis is faster" is not an answer — Couchbase can do almost everything Redis is
+doing here. Know the API well enough to concede that first:
+
+> "Most of what I put in Redis, Couchbase does natively. `binary().increment(key,
+> initial(1).expiry(60s))` is an atomic increment that sets the value *and* the TTL on creation —
+> it solves the same `INCR`-then-`EXPIRE` race my Lua script does, without Lua. Sub-document
+> `arrayAddUnique` gives me atomic test-and-add for the device sets. So the honest answer isn't
+> 'Redis is faster.'
+>
+> Redis is there for **one capability and one property**.
+>
+> The capability is **Pub/Sub** — a cheap, ephemeral, per-correlation-ID channel that a suspended
+> request subscribes to and tears down 40ms later. Couchbase has no equivalent: DCP is a
+> replication stream, not a request-scoped channel, and Eventing is Enterprise-only and
+> mutation-triggered. The sync facade — the best part of this design — has no Couchbase-native
+> implementation.
+>
+> The property is **blast-radius asymmetry**. Couchbase down fails closed: 503, reject. Redis down
+> fails open: signals degrade, payments flow. That only works *because they're separate failure
+> domains*. Collapse them and you're forced to fail closed on everything — so a hiccup in a
+> disposable TTL-bounded counter store stops all payments."
+
+**Then show you actually split the data on a principle, not by habit:**
+
+> "The rule is: does losing this silently produce a *wrong* answer? Velocity windows are
+> disposable — lose them and you set `signalsDegraded`, loudly. But `lifetime_txn_count` is a
+> durable Couchbase binary counter, because Redis runs `allkeys-lru` and would evict it under
+> pressure, resetting a customer's lifetime history to zero **with `signalsDegraded` unset** —
+> Redis was up, it just forgot. A silent wrong answer is worse than a loud missing one."
+
+**And the false positive it prevents** — this is the part that shows judgement rather than recall:
+
+> "That counter exists because `AMOUNT_DEVIATION` fires on `amount_vs_p90_ratio > 3.0`, and p90
+> over two transactions is noise. First purchase ₹100, second ₹400 — ratio 4.0, rule fires, on
+> completely normal behaviour. Every new customer with a slightly larger second purchase gets
+> flagged. So the ratio stays neutral at 1.0 until they've got at least 10 transactions."
+
 ### Why no shared DTO jar?
 
 > "It'd make the contracts compile-time safe, and it turns seven independently deployable services

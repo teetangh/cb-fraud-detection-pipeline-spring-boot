@@ -130,7 +130,17 @@ All of the raw envelope, plus:
 | `is_new_device_high_amt` | boolean | Redis + txn | `deviceId` not in customer's known-device set **and** `amount` > 10 000 | Redis down |
 | `is_off_hours_large` | boolean | txn only | `createdAt` hour ∈ [00:00, 05:00) UTC **and** `amount` > 50 000 | never — computed from the message itself |
 | `merchant_risk_score` | integer 0–100 | Couchbase | Risk score for the MCC, from `intelligence.customer-profiles` MCC table | Couchbase down |
-| `amount_vs_p90_ratio` | number | Couchbase | `amount ÷ customer's p90 historical amount`. `1.0` if no history. | Couchbase down |
+| `lifetime_txn_count` | integer | Couchbase **binary counter** | Durable lifetime transaction count for this customer, including this one | Couchbase down |
+| `amount_vs_p90_ratio` | number | Couchbase | `amount ÷ customer's p90 historical amount`. **`1.0` unless `lifetime_txn_count >= 10`** — see below. | Couchbase down |
+
+> **Why `amount_vs_p90_ratio` is gated on history.** p90 over two transactions is noise. A
+> customer whose first purchase was ₹100 and whose second is ₹400 shows a ratio of ~4.0 and trips
+> `AMOUNT_DEVIATION` (threshold 3.0, weight 20) on entirely normal behaviour — so every new
+> customer making a slightly larger second purchase gets flagged. The signal is therefore neutral
+> (`1.0`) until the customer has at least `enrichment.p90-min-history` (default 10) transactions.
+> `lifetime_txn_count` is a **durable Couchbase binary counter**, not a Redis one, specifically so
+> that a Redis flush cannot silently reset it and re-enable that false positive.
+> → [ADR-0015](adr/0015-two-stores-counter-split.md)
 
 **`signalsDegraded` semantics.** `true` means at least one signal could not be computed. The
 missing keys are listed in `degradedSignalKeys` and are **omitted from the `signals` map

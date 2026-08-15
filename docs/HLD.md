@@ -337,6 +337,15 @@ where two threads both miss the cache and both proceed. [ADR-0006](adr/0006-idem
 
 ## 7. Signal computation and atomicity
 
+Signals split across two stores on one rule: **does losing this silently produce a wrong answer?**
+
+- **Redis** holds ephemeral, TTL-bounded working state — velocity windows, geo/device sets. Losing
+  them costs detection quality for one window and sets `signalsDegraded`, loudly.
+- **Couchbase** holds durable aggregates, including `lifetime_txn_count` via the **Binary
+  Collection counter API** (`binary().increment(key, initial(1))`). A lifetime count that silently
+  reset to zero on a cache eviction would re-enable a real false positive
+  (see [ADR-0015](adr/0015-two-stores-counter-split.md)) with nothing flagging it.
+
 Every check-then-act sequence against Redis is a **single Lua script executed via `EVAL`**, which
 Redis runs atomically server-side. The canonical case:
 
@@ -419,6 +428,7 @@ Bucket: fraud-detection
 ├── Scope: intelligence
 │   ├── fraud-rules        rule::{ruleId}   ·  policy::default
 │   └── customer-profiles  profile::{customerId}  ·  mcc::{code}
+│                          counter::txn::{customerId}   ← binary counter, durable, no TTL
 └── Scope: audit
     ├── decisions          decision::{transactionId}
     ├── audit-ledger       audit::{transactionId}::{eventType}   ← append-only
