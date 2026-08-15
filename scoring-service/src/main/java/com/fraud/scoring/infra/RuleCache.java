@@ -30,35 +30,55 @@ public class RuleCache {
     private final Counter refreshFailedCounter;
 
     /**
-     * Swapped atomically as a whole immutable list.
+     * The ruleset, its version, and whether it has ever loaded, as ONE
+     * immutable value.
      *
-     * <p>A transaction scored mid-refresh must see either the entire old ruleset
-     * or the entire new one — never a mixture. A half-applied ruleset would
-     * produce a score corresponding to no ruleset that ever existed, which is
-     * unexplainable after the fact and would make {@code rulesetVersion} a lie.
+     * <p>Previously these were three independent volatile fields. A transaction
+     * scored between two of those writes could read the NEW rule list but the
+     * OLD {@code rulesetVersion} (or vice versa), so the stamped version would
+     * not actually describe the rules that produced the score — silently
+     * defeating the one property {@code rulesetVersion} exists for (ADR-0008:
+     * an auditor can tell exactly which ruleset produced a historical
+     * decision). Bundling all three into one record swapped through a single
+     * volatile reference makes that tear impossible: a reader always sees a
+     * snapshot that is internally consistent, either entirely before or
+     * entirely after any given refresh.
      */
-    private volatile List<FraudRule> rules = List.of();
-    private volatile String rulesetVersion = "0:empty";
-    private volatile boolean everLoaded = false;
+    public record Snapshot(List<FraudRule> rules, String rulesetVersion, boolean everLoaded) {}
+
+    private volatile Snapshot snapshot = new Snapshot(List.of(), "0:empty", false);
 
     public RuleCache(RuleRepository repository, MeterRegistry meterRegistry) {
         this.repository = repository;
         this.refreshCounter = Counter.builder("fraud.scoring.rules.refresh").register(meterRegistry);
         this.refreshFailedCounter = Counter.builder("fraud.scoring.rules.refresh.failed")
                 .register(meterRegistry);
-        meterRegistry.gauge("fraud.scoring.rules.enabled", this, c -> c.rules.size());
+        meterRegistry.gauge("fraud.scoring.rules.enabled", this, c -> c.snapshot.rules().size());
+    }
+
+    /**
+     * One atomic read of everything a scoring decision needs to stay
+     * self-consistent: the rules, the version that describes them, and whether
+     * they have ever loaded. Callers that need more than one of these fields
+     * for the SAME transaction (the listener) must call this once and reuse
+     * the result, rather than calling {@link #enabledRules()} and
+     * {@link #rulesetVersion()} separately — those can race a concurrent
+     * {@link #refresh}.
+     */
+    public Snapshot snapshot() {
+        return snapshot;
     }
 
     public List<FraudRule> enabledRules() {
-        return rules;
+        return snapshot.rules();
     }
 
     public String rulesetVersion() {
-        return rulesetVersion;
+        return snapshot.rulesetVersion();
     }
 
     public boolean everLoaded() {
-        return everLoaded;
+        return snapshot.everLoaded();
     }
 
     @Scheduled(fixedDelayString = "${rules.refresh-interval-ms:60000}")
@@ -67,20 +87,26 @@ public class RuleCache {
     }
 
     /**
+     * Synchronized so the scheduled timer and a concurrent force-refresh
+     * (POST /admin/rules/refresh) cannot interleave their reads of Couchbase
+     * with their writes of {@link #snapshot} — without this, two overlapping
+     * refreshes could each compute a version from a different read and then
+     * publish them out of order, again breaking the one-version-per-ruleset
+     * guarantee.
+     *
      * @param consistent when true, reads with {@code REQUEST_PLUS}. Required for
      *   the force-refresh endpoint: the caller has just edited a rule and is
      *   asking for it NOW, and N1QL defaults to {@code NOT_BOUNDED}, so a
      *   stale read would defeat the entire point of the endpoint (LLD §7).
      */
-    public void refresh(boolean consistent) {
+    public synchronized void refresh(boolean consistent) {
         try {
-            List<FraudRule> loaded = repository.findEnabled(consistent);
-            this.rules = List.copyOf(loaded);
-            this.rulesetVersion = computeVersion(loaded);
-            this.everLoaded = true;
+            List<FraudRule> loaded = List.copyOf(repository.findEnabled(consistent));
+            String version = computeVersion(loaded);
+            this.snapshot = new Snapshot(loaded, version, true);
             refreshCounter.increment();
             log.info("Ruleset refreshed count={} version={} consistent={}",
-                     loaded.size(), rulesetVersion, consistent);
+                     loaded.size(), version, consistent);
         } catch (Exception e) {
             refreshFailedCounter.increment();
             // Keep serving the last known good ruleset. Scoring with slightly
@@ -88,8 +114,9 @@ public class RuleCache {
             // ScoringReadinessIndicator: degrading with stale rules is safe,
             // STARTING with no rules is not, because everything would score 0
             // and 0 means ALLOW.
+            Snapshot current = this.snapshot;
             log.error("Ruleset refresh FAILED — continuing with the last known good ruleset "
-                      + "(count={}, version={})", rules.size(), rulesetVersion, e);
+                      + "(count={}, version={})", current.rules().size(), current.rulesetVersion(), e);
         }
     }
 

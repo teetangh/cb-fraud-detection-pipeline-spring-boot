@@ -95,16 +95,37 @@ public class RuleRepository {
         };
     }
 
-    private static FraudRule toRule(JsonObject json) {
+    /** Package-private so {@code RuleRepositoryTest} can exercise it without a live cluster. */
+    static FraudRule toRule(JsonObject json) {
+        String ruleId = json.getString("ruleId");
         BigDecimal threshold = readThreshold(json);
         return new FraudRule(
-                json.getString("ruleId"),
+                ruleId,
                 json.getString("description"),
                 json.getString("signalKey"),
                 RuleOperator.parse(json.getString("operator"), threshold),
-                json.getInt("weight"),
+                requireIntField(ruleId, "weight", json.getInt("weight")),
                 json.getBoolean("enabled"),
                 json.getString("category"),
-                json.getInt("version"));
+                requireIntField(ruleId, "version", json.getInt("version")));
+    }
+
+    /**
+     * {@code JsonObject.getInt} returns a boxed {@code Integer}, {@code null}
+     * for a missing field — and {@link FraudRule}'s {@code weight}/{@code
+     * version} are primitive {@code int}, so passing that null straight
+     * through auto-unboxes to a bare {@code NullPointerException} with no
+     * indication of which rule or field was at fault. One hand-edited document
+     * missing a field would fail this way and abort the whole {@code
+     * findEnabled} load — exactly the "empty ruleset" failure mode this class's
+     * {@link #readThreshold} javadoc already warns about, just for a different
+     * field.
+     */
+    private static int requireIntField(String ruleId, String field, Integer value) {
+        if (value == null) {
+            throw new IllegalArgumentException(
+                    "Rule '" + ruleId + "' is missing its required '" + field + "' field.");
+        }
+        return value;
     }
 }

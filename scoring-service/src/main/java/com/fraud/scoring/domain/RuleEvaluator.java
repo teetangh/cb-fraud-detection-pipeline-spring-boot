@@ -58,7 +58,7 @@ public final class RuleEvaluator {
                 continue;
             }
 
-            if (matches(rule.operator(), value)) {
+            if (matches(rule, value)) {
                 triggered.add(new TriggeredRule(
                         rule.ruleId(), rule.weight(), value,
                         rule.operator().thresholdOrNull(), rule.operator().name(),
@@ -67,16 +67,40 @@ public final class RuleEvaluator {
             }
         }
 
-        return new ScoreResult(Math.min(total, MAX_SCORE), List.copyOf(triggered));
+        // clamp, not just cap: a hand-edited rule with a negative weight (a
+        // typo, not a deliberate feature — spec §8 documents weight as
+        // 0-100) must not be able to push the score below the documented
+        // floor either.
+        return new ScoreResult(Math.clamp(total, 0, MAX_SCORE), List.copyOf(triggered));
     }
 
     /** Exhaustive over the sealed hierarchy — no {@code default} branch by design. */
-    private boolean matches(RuleOperator operator, Object value) {
+    private boolean matches(FraudRule rule, Object value) {
+        RuleOperator operator = rule.operator();
+        if (operator instanceof RuleOperator.BooleanTrue) {
+            return value instanceof Boolean bool && bool;
+        }
+
+        // A rule can point a numeric operator at a signal that turns out not
+        // to be numeric — a rule/signal mismatch, not a JVM-level bug. That
+        // must cost this ONE rule, not the whole transaction: the previous
+        // behaviour threw out of score() entirely, which meant one
+        // misconfigured rule silently zeroed out every OTHER rule's
+        // contribution too, and — via the listener — could abort the ack and
+        // stall the partition.
+        BigDecimal actual = asNumberOrNull(value);
+        if (actual == null) {
+            log.warn("Rule {} expects a numeric signal for '{}' but the value was {} ({}) — "
+                     + "treating as not-matched rather than aborting scoring.",
+                     rule.ruleId(), rule.signalKey(), value,
+                     value == null ? "null" : value.getClass().getSimpleName());
+            return false;
+        }
         return switch (operator) {
-            case RuleOperator.BooleanTrue b -> value instanceof Boolean bool && bool;
-            case RuleOperator.GreaterThan g -> asNumber(value).compareTo(g.threshold()) > 0;
-            case RuleOperator.LessThan l    -> asNumber(value).compareTo(l.threshold()) < 0;
-            case RuleOperator.Equals e      -> asNumber(value).compareTo(e.threshold()) == 0;
+            case RuleOperator.BooleanTrue b -> false; // handled above
+            case RuleOperator.GreaterThan g -> actual.compareTo(g.threshold()) > 0;
+            case RuleOperator.LessThan l    -> actual.compareTo(l.threshold()) < 0;
+            case RuleOperator.Equals e      -> actual.compareTo(e.threshold()) == 0;
         };
     }
 
@@ -85,17 +109,25 @@ public final class RuleEvaluator {
      * Long or Double depending on the value. Comparing via BigDecimal keeps the
      * threshold test exact — a double comparison here would make
      * {@code amount_vs_p90_ratio > 3.0} unreliable at the boundary.
+     *
+     * @return the numeric value, or {@code null} if {@code value} is not
+     *   coercible to a number (a non-numeric string, a boolean compared
+     *   against a numeric operator, and so on) — callers treat that as "this
+     *   rule does not match," not as an error.
      */
-    private static BigDecimal asNumber(Object value) {
-        return switch (value) {
-            case BigDecimal bd -> bd;
-            case Integer i     -> BigDecimal.valueOf(i);
-            case Long l        -> BigDecimal.valueOf(l);
-            case Double d      -> BigDecimal.valueOf(d);
-            case Number n      -> new BigDecimal(n.toString());
-            case String s      -> new BigDecimal(s);
-            default -> throw new IllegalArgumentException(
-                    "Signal value is not numeric: " + value + " (" + value.getClass() + ")");
-        };
+    private static BigDecimal asNumberOrNull(Object value) {
+        try {
+            return switch (value) {
+                case BigDecimal bd -> bd;
+                case Integer i     -> BigDecimal.valueOf(i);
+                case Long l        -> BigDecimal.valueOf(l);
+                case Double d      -> BigDecimal.valueOf(d);
+                case Number n      -> new BigDecimal(n.toString());
+                case String s      -> new BigDecimal(s);
+                default -> null;
+            };
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 }
