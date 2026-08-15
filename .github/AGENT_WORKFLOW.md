@@ -47,7 +47,33 @@ Branch naming: `p1-infra`, `p2-scaffolding`, `p3-ingestion`, … Conflicts are r
 Work in this order. The order matters: **articulate findings before you are in a position to
 rationalise them away.**
 
-### 1. Review first, fix second
+### 0. Triage CodeRabbit first
+
+**CodeRabbit reviews every PR on this repo.** Read its comments before forming your own view:
+
+```bash
+gh pr view <N> --json comments,reviews
+gh api repos/{owner}/{repo}/pulls/<N>/comments --jq '.[] | "\(.path):\(.line) \(.body)"'
+```
+
+CodeRabbit is a **generic** reviewer. It has not read `FRAUD_PIPELINE_BUILD_SPEC.txt`, and does not
+know that `insert()` must never become `upsert()`, that the rebalance test must *fail* under
+`RangeAssignor`, or that a degraded signal must be absent rather than zero. So a real share of its
+comments will be style, taste, or scope expansion — **deciding which is which is the job**, and it
+is why this is a triage step and not an auto-apply.
+
+Judge each comment against the authority order in step 1, then:
+
+- **Legitimate** → fix it, and reply on the thread saying what changed.
+- **Rejected** → reply with the reason, citing the ADR or spec section that makes the current
+  behaviour deliberate. Never silently ignore one: an unanswered review comment is
+  indistinguishable from a missed one.
+- **Real but out of scope** → open an issue, link it in the reply, move on.
+
+A CodeRabbit comment is evidence, not an instruction. Where it contradicts a merged ADR, the ADR
+wins — and you say so on the thread rather than just declining.
+
+### 1. Then review it yourself, and fix only after
 
 Read the diff against three things, in this order of authority:
 
@@ -94,6 +120,13 @@ All of these, no exceptions:
 - [ ] No test assertion was weakened, deleted, or `@Disabled` to get green.
 - [ ] Docs updated if behaviour changed.
 - [ ] Every posted finding is either fixed, or has a reply explaining why not.
+- [ ] **Every CodeRabbit comment has been replied to** — fixed, rejected with a reason, or
+      converted to an issue.
+
+If CI is unavailable for an infrastructure reason (billing, outage) rather than failing on this
+PR's code, that is a `needs-human` escalation, not a judgement call to make alone. Say so on the
+PR and do not merge. Note that CI here only compiles and runs `*Test`; it skips every `*IT`, so
+running the integration suite locally is required regardless of what CI says.
 
 ### 4. Merge
 
@@ -169,6 +202,11 @@ version of each. Things already verified against the real classpath and recorded
   `QueryOptions.scanConsistency(QueryScanConsistency.REQUEST_PLUS)`. This already broke the Phase 1
   probe once; if a query-based test is intermittently green, check this first. See
   [LLD §7](../docs/LLD.md#7-couchbase-query-consistency--read-after-write-is-not-free).
+- **`CollectionManager.createCollection(CollectionSpec)` does not work on Couchbase CE.**
+  `CollectionSpec` carries a `maxTTL` that the SDK always sends, and CE rejects it:
+  `{"errors":{"maxTTL":"Supported in enterprise edition only"}}`. Use the two-arg
+  `createCollection(scopeName, collectionName)` instead. Every service's integration test
+  provisions collections this way.
 - **Do not assert `plan.contains("IndexScan")`.** Couchbase picks among `IndexScan3`,
   `IndexCountScan2`, `DistinctScan`, `IntersectScan` by query shape — a covering `COUNT` plans to
   `IndexCountScan2`, which is a *better* plan and does not contain that substring. This also broke

@@ -1,0 +1,140 @@
+package com.fraud.ingestion;
+
+import com.couchbase.client.java.Cluster;
+import com.couchbase.client.java.query.QueryOptions;
+import com.couchbase.client.java.query.QueryScanConsistency;
+import com.fraud.ingestion.domain.IngestionResult;
+import com.fraud.ingestion.domain.PaymentMethod;
+import com.fraud.ingestion.domain.TransactionRecord;
+import com.fraud.ingestion.infra.TransactionIngestor;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+
+/**
+ * T3 — duplicate request idempotency (spec §10, ADR-0006).
+ *
+ * <p>The two requests are driven CONCURRENTLY from two threads, released together
+ * by a latch. That is the whole point: a sequential version of this test passes
+ * with only the Redis check in place and proves nothing. It is the concurrent
+ * case that exercises the window where both requests miss the cache and both
+ * proceed — which only Couchbase {@code insert()} closes.
+ */
+@SpringBootTest(properties = "outbox.publisher.enabled=true")
+@DisplayName("T3 — duplicate request idempotency")
+class DuplicateIngestionIT extends AbstractIngestionIT {
+
+    @Autowired TransactionIngestor ingestor;
+    @Autowired Cluster cluster;
+
+    @Test
+    @DisplayName("two concurrent identical transactionIds produce exactly one record and one event")
+    void concurrentDuplicatesResolveToOne() throws Exception {
+        String transactionId = "txn-" + UUID.randomUUID();
+        String customerId = "cust-dup-" + UUID.randomUUID();
+        TransactionRecord txn = sampleTransaction(transactionId, customerId);
+
+        // ── fire both requests genuinely simultaneously ──────────────────────
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch release = new CountDownLatch(1);
+
+        Callable<IngestionResult> attempt = () -> {
+            release.await();
+            return ingestor.ingest(txn);
+        };
+        Future<IngestionResult> first = pool.submit(attempt);
+        Future<IngestionResult> second = pool.submit(attempt);
+
+        release.countDown();
+        IngestionResult resultA = first.get(30, TimeUnit.SECONDS);
+        IngestionResult resultB = second.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // ── both callers get the SAME decision-relevant answer ───────────────
+        assertThat(resultA.transactionId()).isEqualTo(transactionId);
+        assertThat(resultB.transactionId()).isEqualTo(transactionId);
+        assertThat(resultA.correlationId())
+                .as("both callers must receive the same correlationId, or they act on "
+                    + "different identities for one transaction")
+                .isEqualTo(resultB.correlationId());
+
+        // Exactly one of them was the winner.
+        List<IngestionResult.Status> statuses = List.of(resultA.status(), resultB.status());
+        assertThat(statuses).containsExactlyInAnyOrder(
+                IngestionResult.Status.ACCEPTED, IngestionResult.Status.DUPLICATE);
+
+        // ── exactly ONE document in Couchbase ────────────────────────────────
+        long docCount = cluster.query("""
+                        SELECT RAW COUNT(*)
+                        FROM `%s`.`transactions`.`raw-transactions` t
+                        WHERE t.transactionId = $txnId
+                        """.formatted(BUCKET),
+                        QueryOptions.queryOptions()
+                                .parameters(com.couchbase.client.java.json.JsonObject.create()
+                                        .put("txnId", transactionId))
+                                // REQUEST_PLUS: this reads immediately after a write, and
+                                // N1QL defaults to NOT_BOUNDED (LLD §7).
+                                .scanConsistency(QueryScanConsistency.REQUEST_PLUS))
+                .rowsAs(Long.class).getFirst();
+
+        assertThat(docCount)
+                .as("upsert() instead of insert() would leave one document here too — but it "
+                    + "would have OVERWRITTEN the original and written a second outbox row")
+                .isEqualTo(1L);
+
+        // ── exactly ONE outbox row ───────────────────────────────────────────
+        long outboxCount = cluster.query("""
+                        SELECT RAW COUNT(*)
+                        FROM `%s`.`transactions`.`outbox` o
+                        WHERE o.payload.transactionId = $txnId
+                        """.formatted(BUCKET),
+                        QueryOptions.queryOptions()
+                                .parameters(com.couchbase.client.java.json.JsonObject.create()
+                                        .put("txnId", transactionId))
+                                .scanConsistency(QueryScanConsistency.REQUEST_PLUS))
+                .rowsAs(Long.class).getFirst();
+
+        assertThat(outboxCount).isEqualTo(1L);
+
+        // ── exactly ONE Kafka event ──────────────────────────────────────────
+        // This is the assertion that catches the real damage of upsert(): a second
+        // outbox row means a second pipeline event, which double-increments the
+        // velocity counter and can get a legitimately retrying customer blocked.
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            List<ConsumerRecord<String, String>> matching = drainMatching(RAW_TOPIC, transactionId);
+            assertThat(matching)
+                    .as("exactly one event on %s for transactionId=%s", RAW_TOPIC, transactionId)
+                    .hasSize(1);
+            assertThat(matching.getFirst().key())
+                    .as("keyed by customerId so one customer's events stay on one partition "
+                        + "and in order (ADR-0012)")
+                    .isEqualTo(customerId);
+        });
+    }
+
+
+    static TransactionRecord sampleTransaction(String transactionId, String customerId) {
+        return new TransactionRecord(
+                transactionId, customerId, "merch-1", "5411",
+                new BigDecimal("149.50"), "INR", "IN",
+                "dev-1", "203.0.113.44", PaymentMethod.CARD,
+                UUID.randomUUID().toString(), Instant.now());
+    }
+}
