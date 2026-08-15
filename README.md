@@ -6,7 +6,7 @@ completes, within a hard 150ms budget — over a fully asynchronous Kafka backbo
 Everything runs locally on real infrastructure: real Kafka, real Redis, real Couchbase. No
 in-memory fakes, no cloud dependency, one `docker compose up`.
 
-> **Status: all seven services built and unit/integration tested. What remains is the full-stack end-to-end run (T1/T2/T5/T6/T7/T10).**
+> **Status: all seven services built, and T10 passes 18/18 against the live stack. Measured warm end-to-end latency: p50 30ms, max 32ms — inside the 150ms budget. T5 remains.**
 > Phase 1 (infra + the Couchbase CE capability gate) and Phase 2a (`ingestion-service`, with
 > **T3 and T4 passing** against real Kafka/Redis/Couchbase) are done. Implementation follows the
 > phase order in [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt) — see
@@ -323,7 +323,8 @@ Built in the phase order of spec §12, each phase gated on its acceptance tests.
 | 3a | `enrichment-service` + Lua signals | **Lua concurrency 5/5** | [#15](../../pull/15) | ✅ |
 | 3b | `scoring-service` + rule engine | **T8 5/5, T2 scoring half, 7 unit** | [#16](../../pull/16) | ✅ |
 | 4 | `decision-service` + the sync facade | **sync-facade 4/4, 12 gateway, 11 policy** | [#17](../../pull/17) | ✅ |
-| 5 | `action-audit-service` + reconciliation | **T9 3/3**; T7b + T10 need the full stack | [#18](../../pull/18) | 🔄 |
+| 5 | `action-audit-service` + reconciliation | **T9 3/3** | [#18](../../pull/18) | ✅ |
+| — | **T10 full-stack smoke** | **18/18 against the live 10-container stack** | — | ✅ |
 | 6 | Cooperative rebalance proof | **T5** | — | ⬜ |
 
 **All 7 services built**, every one verified against real Kafka / Redis / Couchbase — never
@@ -336,7 +337,7 @@ in-memory fakes.
 | [#9](../../issues/9) | No circuit breaker on gateway → ingestion. The *slow* case, not the dead one, is what hurts. |
 | [#12](../../issues/12) | Residual outbox double-publish window on ack-timeout. Needs a CAS claim + a dedup key consumed by enrichment. |
 | [#14](../../issues/14) | `mock-payment-api` has no tests. It is a stub, but that should be a decision rather than an omission. |
-| — | The full-stack T10 run needs ~4.6 GB and has not yet been executed on this machine. |
+| — | T5 (cooperative rebalance) is the last unbuilt acceptance test. |
 
 Not "done" until T1–T10 pass against the real Compose stack, not only against Testcontainers.
 

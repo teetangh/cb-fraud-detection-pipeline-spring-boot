@@ -43,6 +43,7 @@ public class OutboxPublisher {
 
     private final Counter publishedCounter;
     private final Counter failedCounter;
+    private final Counter staleSkipCounter;
     private final Timer publishLatency;
     private final AtomicLong pendingGauge = new AtomicLong();
 
@@ -68,10 +69,21 @@ public class OutboxPublisher {
 
         this.publishedCounter = Counter.builder("fraud.ingestion.outbox.published")
                 .register(meterRegistry);
+        // Rows the GSI still reported as PENDING that the nudge had already
+        // published. Expected to be non-zero in normal operation — it is the
+        // index lag being absorbed, not an error.
+        this.staleSkipCounter = Counter.builder("fraud.ingestion.outbox.stale_skipped")
+                .register(meterRegistry);
         this.failedCounter = Counter.builder("fraud.ingestion.outbox.publish.failed")
                 .register(meterRegistry);
         this.publishLatency = Timer.builder("fraud.ingestion.outbox.publish.latency")
-                .description("Couchbase commit to Kafka ack").register(meterRegistry);
+                // Measures publish() -> broker ack, NOT commit -> ack. The distinction
+                // mattered: while the nudge still went through findPending, this
+                // metric read a healthy ~15ms and completely hid a ~195ms GSI
+                // index-lag gap between commit and pickup. Named for what it
+                // actually measures.
+                .description("OutboxPublisher.publish() invocation to Kafka broker ack")
+                .register(meterRegistry);
 
         // The earliest available signal that Kafka is unreachable or the
         // publisher is dead — well ahead of any consumer-lag alarm.
@@ -126,32 +138,98 @@ public class OutboxPublisher {
     private final java.util.concurrent.atomic.AtomicBoolean polling =
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
+    /**
+     * Set when a nudge arrives while a poll is already running, so that poll
+     * rescans before releasing instead of the new row waiting a full tick.
+     *
+     * <p>This is not a micro-optimisation. Without it, measured end-to-end latency
+     * clustered hard at 199-209ms — the poll interval — because a nudge that
+     * collided with a running poll was simply dropped, and the row it was
+     * announcing waited for the next tick. 200ms is more than the entire 150ms
+     * decision budget, so effectively every colliding transaction timed out.
+     *
+     * <p>The earlier code discarded the nudge with the comment "a poll is already
+     * in flight; it will pick these rows up". <b>That was false</b>: the running
+     * poll had already executed its {@code findPending} query before this row
+     * committed, so it could not see it. A comment asserting a guarantee the code
+     * does not provide is worse than no comment.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean rescanRequested =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     @Scheduled(fixedDelayString = "${outbox.poll-interval-ms:200}")
     public void publishPending() {
         if (!enabled) {
             return;
         }
         if (!polling.compareAndSet(false, true)) {
-            return;   // a poll is already in flight; it will pick these rows up
+            // A poll is in flight and has ALREADY queried. Ask it to look again
+            // before it finishes, rather than losing this row to the next tick.
+            rescanRequested.set(true);
+            return;
         }
         try {
+            do {
+                rescanRequested.set(false);
+                drainOnce();
+                // Loop if a nudge arrived while we were draining. Checked AFTER
+                // the drain and cleared BEFORE it, so a nudge that lands
+                // mid-drain is never lost.
+            } while (rescanRequested.get());
+        } finally {
+            polling.set(false);
+        }
+    }
+
+    private void drainOnce() {
+        try {
             List<OutboxEvent> pending = outboxRepository.findPending(BATCH_SIZE);
-            // NOT pending.size(): findPending is capped at BATCH_SIZE, so that
-            // value can never exceed 100 and the gauge could never show the
-            // "monotonic climb" that ADR-0005 names as the earliest signal Kafka
-            // is unreachable. countPending() reports the true backlog and is
-            // backed by the same partial idx_outbox_pending index, so its cost
-            // already tracks the pending depth rather than total history.
-            pendingGauge.set(outboxRepository.countPending());
             for (OutboxEvent event : pending) {
+                // Re-check by KEY before publishing. findPending reads a GSI that
+                // lags ~195ms, so a row the nudge already published and marked
+                // PUBLISHED still shows up here as PENDING. Publishing it again
+                // is a genuine duplicate on the topic, and the velocity counter
+                // is not idempotent under redelivery.
+                if (!outboxRepository.isStillPending(event.outboxId())) {
+                    staleSkipCounter.increment();
+                    continue;
+                }
                 publish(event);
             }
         } catch (Exception e) {
             // Never let a poll failure kill the scheduler thread — the next tick
             // must still run, or the pipeline stalls silently.
             log.error("Outbox poll failed; will retry on next tick", e);
-        } finally {
-            polling.set(false);
+        }
+    }
+
+    /**
+     * The backlog gauge, sampled on its OWN slow schedule — deliberately not on
+     * the drain path.
+     *
+     * <p>It cannot be {@code pending.size()}: {@code findPending} is capped at
+     * {@code BATCH_SIZE}, so the gauge would saturate at 100 and could never show
+     * the "monotonic climb" ADR-0005 names as the earliest signal that Kafka is
+     * unreachable. That was a real defect, caught in review on PR #11.
+     *
+     * <p>But the first fix put {@code countPending()} inside the drain, which
+     * <b>doubled the N1QL query count on the highest-QPS path in the system</b> —
+     * two queries per poll instead of one, on the critical path of every
+     * transaction. A monitoring read has no business competing with the work it
+     * monitors.
+     *
+     * <p>5s resolution is ample: this gauge answers "is the backlog growing", a
+     * question about trend, not about any individual transaction.
+     */
+    @Scheduled(fixedDelayString = "${outbox.gauge-interval-ms:5000}")
+    public void sampleBacklogGauge() {
+        if (!enabled) {
+            return;
+        }
+        try {
+            pendingGauge.set(outboxRepository.countPending());
+        } catch (Exception e) {
+            log.debug("Outbox backlog gauge sample failed", e);
         }
     }
 
@@ -170,8 +248,13 @@ public class OutboxPublisher {
      */
     @EventListener
     @Async("outboxNudgeExecutor")
-    public void onCommitted(TransactionIngestor.OutboxRecordCommitted event) {
-        publishPending();
+    public void onCommitted(TransactionIngestor.OutboxRecordCommitted committed) {
+        if (!enabled) {
+            return;
+        }
+        // Publish the event we were handed. No findPending, so no waiting on the
+        // GSI to index a row committed microseconds ago.
+        publish(committed.event());
     }
 
     private void publish(OutboxEvent event) {

@@ -27,9 +27,18 @@ public class AsyncConfig {
     @Bean("outboxNudgeExecutor")
     public ThreadPoolTaskExecutor outboxNudgeExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(1);
-        executor.setMaxPoolSize(2);
-        executor.setQueueCapacity(50);
+        // Sized for BLOCKING work. The nudge no longer just wakes a poller — it
+        // performs the Kafka publish itself and blocks up to ACK_TIMEOUT_SECONDS
+        // waiting for the broker ack, so a 1-2 thread pool serialises every
+        // transaction behind one in-flight ack.
+        //
+        // Measured: with core=1/max=2/queue=50, a burst of 30 transactions saw
+        // only 8 reach a decision — the rest had their nudges DISCARDED and fell
+        // back to the timer, which is correct but slow. The pool must be able to
+        // absorb the arrival rate, not just signal it.
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(8);
+        executor.setQueueCapacity(500);
         executor.setThreadNamePrefix("outbox-nudge-");
         executor.setRejectedExecutionHandler(new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy());
         executor.initialize();

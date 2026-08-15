@@ -78,14 +78,24 @@ public class TransactionIngestor {
 
         // ── Layer 2: Couchbase. THE authoritative guard. ─────────────────────
         try {
-            IngestionResult result = transactionTimer.recordCallable(() -> commit(txn));
+            Committed committed = transactionTimer.recordCallable(() -> commit(txn));
+            IngestionResult result = committed.result();
             acceptedCounter.increment();
             idempotencyCache.remember(result);
 
-            // Wake the publisher now rather than waiting up to a full poll
-            // interval. The scheduled poll remains the correctness backstop;
-            // this is purely the latency optimisation. BOTH are needed.
-            events.publishEvent(new OutboxRecordCommitted(txn.transactionId()));
+            // Hand the publisher the event ITSELF, not just a wake-up.
+            //
+            // A bare nudge would make the publisher query for the row — and
+            // findPending uses NOT_BOUNDED scan consistency, so the GSI has not
+            // yet indexed the row we just committed. Measured, that lag is
+            // ~195ms: MORE than the entire 150ms decision budget, and completely
+            // independent of how often we poll (proven by dropping the interval
+            // to 20ms and seeing no improvement).
+            //
+            // Passing the event skips the index entirely on the happy path. The
+            // scheduled poll remains the correctness backstop for crash
+            // recovery, where index lag does not matter.
+            events.publishEvent(new OutboxRecordCommitted(committed.outboxEvent()));
 
             log.info("Accepted transactionId={} customerId={} correlationId={}",
                      txn.transactionId(), txn.customerId(), txn.correlationId());
@@ -113,7 +123,7 @@ public class TransactionIngestor {
      * error, no retry, no alert, and the transaction is simply never checked for
      * fraud. See ADR-0005.
      */
-    private IngestionResult commit(TransactionRecord txn) {
+    private Committed commit(TransactionRecord txn) {
         Instant now = Instant.now();
         OutboxEvent event = OutboxEvent.pendingFor(txn, rawTopic, now);
         TransactionRecord stamped = txn.createdAt() == null
@@ -134,9 +144,21 @@ public class TransactionIngestor {
             ctx.insert(outbox, eventForStamped.documentKey(), DocumentMapper.toJson(eventForStamped));
         });
 
-        return new IngestionResult(stamped.transactionId(), stamped.correlationId(),
-                                   IngestionResult.Status.ACCEPTED);
+        return new Committed(
+                new IngestionResult(stamped.transactionId(), stamped.correlationId(),
+                                    IngestionResult.Status.ACCEPTED),
+                eventForStamped);
     }
+
+    /**
+     * What one successful commit produced: the caller's response, and the outbox
+     * event that was written alongside it.
+     *
+     * <p>The event is returned rather than re-read because re-reading means a
+     * GSI query, and the index has not yet caught up with a row committed
+     * microseconds ago — a ~195ms wait that exceeds the entire decision budget.
+     */
+    private record Committed(IngestionResult result, OutboxEvent outboxEvent) {}
 
     /**
      * The SDK wraps the cause in a TransactionFailedException, so catching
@@ -172,8 +194,12 @@ public class TransactionIngestor {
         }
     }
 
-    /** Signals the OutboxPublisher that there is fresh work, ahead of its timer. */
-    public record OutboxRecordCommitted(String transactionId) {}
+    /**
+     * Carries the freshly committed outbox event so the publisher can send it
+     * without a GSI read. See the comment at the publish site for why the query
+     * path cannot meet the latency budget.
+     */
+    public record OutboxRecordCommitted(OutboxEvent event) {}
 
     public static class IngestionFailedException extends RuntimeException {
         public IngestionFailedException(String message, Throwable cause) {

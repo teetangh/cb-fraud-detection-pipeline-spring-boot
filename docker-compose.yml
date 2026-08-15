@@ -200,12 +200,17 @@ services:
       CB_USER: ${CB_USER:-Administrator}
       CB_PASSWORD: ${CB_PASSWORD:-password}
       CB_BUCKET: ${CB_BUCKET:-fraud-detection}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-200}
       # -XX:TieredStopAtLevel=1 disables the C2 JIT: much lower startup cost and
       # memory, at the cost of peak throughput. The right trade for seven JVMs on
       # one laptop, the wrong one in production — REMOVE IT before quoting any
       # p99, or the number describes the JIT setting rather than the design.
-      JAVA_OPTS: >-
-        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+      # -XX:TieredStopAtLevel=1 disables the C2 JIT: much lower startup cost and
+      # memory, at the cost of peak throughput and LATENCY. Right for seven JVMs
+      # on one laptop, wrong for measuring p99 — override JAVA_OPTS_TUNING in
+      # .env before quoting any latency number, or you are measuring the JIT
+      # setting rather than the design (see docs/LLD.md §9).
+      JAVA_OPTS: ${JAVA_OPTS_TUNING:--XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8082/actuator/health/readiness | grep -q UP"]
       interval: 10s
@@ -235,8 +240,12 @@ services:
       CB_USER: ${CB_USER:-Administrator}
       CB_PASSWORD: ${CB_PASSWORD:-password}
       CB_BUCKET: ${CB_BUCKET:-fraud-detection}
-      JAVA_OPTS: >-
-        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+      # -XX:TieredStopAtLevel=1 disables the C2 JIT: much lower startup cost and
+      # memory, at the cost of peak throughput and LATENCY. Right for seven JVMs
+      # on one laptop, wrong for measuring p99 — override JAVA_OPTS_TUNING in
+      # .env before quoting any latency number, or you are measuring the JIT
+      # setting rather than the design (see docs/LLD.md §9).
+      JAVA_OPTS: ${JAVA_OPTS_TUNING:--XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8083/actuator/health/readiness | grep -q UP"]
       interval: 10s
@@ -263,8 +272,12 @@ services:
       CB_USER: ${CB_USER:-Administrator}
       CB_PASSWORD: ${CB_PASSWORD:-password}
       CB_BUCKET: ${CB_BUCKET:-fraud-detection}
-      JAVA_OPTS: >-
-        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+      # -XX:TieredStopAtLevel=1 disables the C2 JIT: much lower startup cost and
+      # memory, at the cost of peak throughput and LATENCY. Right for seven JVMs
+      # on one laptop, wrong for measuring p99 — override JAVA_OPTS_TUNING in
+      # .env before quoting any latency number, or you are measuring the JIT
+      # setting rather than the design (see docs/LLD.md §9).
+      JAVA_OPTS: ${JAVA_OPTS_TUNING:--XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1}
     healthcheck:
       # Readiness is DOWN until a ruleset has loaded. An empty ruleset scores
       # every transaction 0, and 0 means ALLOW - so a scoring service that
@@ -297,8 +310,12 @@ services:
       CB_USER: ${CB_USER:-Administrator}
       CB_PASSWORD: ${CB_PASSWORD:-password}
       CB_BUCKET: ${CB_BUCKET:-fraud-detection}
-      JAVA_OPTS: >-
-        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+      # -XX:TieredStopAtLevel=1 disables the C2 JIT: much lower startup cost and
+      # memory, at the cost of peak throughput and LATENCY. Right for seven JVMs
+      # on one laptop, wrong for measuring p99 — override JAVA_OPTS_TUNING in
+      # .env before quoting any latency number, or you are measuring the JIT
+      # setting rather than the design (see docs/LLD.md §9).
+      JAVA_OPTS: ${JAVA_OPTS_TUNING:--XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1}
     healthcheck:
       # DOWN until a policy has loaded. Defaulting a policy would silently invent
       # business rules, and the likely default - everything ALLOW - is the
@@ -329,8 +346,12 @@ services:
       CB_PASSWORD: ${CB_PASSWORD:-password}
       CB_BUCKET: ${CB_BUCKET:-fraud-detection}
       MOCK_PAYMENT_URL: http://mock-payment-api:8080
-      JAVA_OPTS: >-
-        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+      # -XX:TieredStopAtLevel=1 disables the C2 JIT: much lower startup cost and
+      # memory, at the cost of peak throughput and LATENCY. Right for seven JVMs
+      # on one laptop, wrong for measuring p99 — override JAVA_OPTS_TUNING in
+      # .env before quoting any latency number, or you are measuring the JIT
+      # setting rather than the design (see docs/LLD.md §9).
+      JAVA_OPTS: ${JAVA_OPTS_TUNING:--XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1}
     # NO depends_on for mock-payment-api, deliberately. The webhook receiver's
     # availability must never gate this service starting or acking - that is the
     # same reason the offset commit happens BEFORE webhook delivery.
@@ -360,8 +381,12 @@ services:
       INGESTION_URL: http://ingestion-service:8082
       JWT_SECRET: ${JWT_SECRET:-local-dev-only-not-a-real-secret-change-me}
       RATE_LIMIT_RPM: ${RATE_LIMIT_RPM:-100}
-      JAVA_OPTS: >-
-        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+      # -XX:TieredStopAtLevel=1 disables the C2 JIT: much lower startup cost and
+      # memory, at the cost of peak throughput and LATENCY. Right for seven JVMs
+      # on one laptop, wrong for measuring p99 — override JAVA_OPTS_TUNING in
+      # .env before quoting any latency number, or you are measuring the JIT
+      # setting rather than the design (see docs/LLD.md §9).
+      JAVA_OPTS: ${JAVA_OPTS_TUNING:--XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8081/actuator/health/readiness | grep -q UP"]
       interval: 10s
@@ -385,8 +410,12 @@ services:
       # Must match the gateway's secret — with a symmetric secret, minter and
       # verifier share one key. That is the weakness, not an accident (issue #6).
       JWT_SECRET: ${JWT_SECRET:-local-dev-only-not-a-real-secret-change-me}
-      JAVA_OPTS: >-
-        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+      # -XX:TieredStopAtLevel=1 disables the C2 JIT: much lower startup cost and
+      # memory, at the cost of peak throughput and LATENCY. Right for seven JVMs
+      # on one laptop, wrong for measuring p99 — override JAVA_OPTS_TUNING in
+      # .env before quoting any latency number, or you are measuring the JIT
+      # setting rather than the design (see docs/LLD.md §9).
+      JAVA_OPTS: ${JAVA_OPTS_TUNING:--XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health/readiness | grep -q UP"]
       interval: 10s

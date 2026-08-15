@@ -42,7 +42,7 @@ fraud:
     raw: fraud.transactions.raw
 
 outbox:
-  poll-interval-ms: 200
+  poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:200}
   # MUST be true in any real run. Setting it false freezes the publisher after
   # the Couchbase commit and before the Kafka publish — the T4 test hook.
   publisher:
