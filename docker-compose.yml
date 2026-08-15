@@ -311,6 +311,38 @@ services:
     mem_limit: 320m
     networks: [fraud-net]
 
+  action-audit-service:
+    build:
+      context: ./action-audit-service
+    container_name: fraud-audit
+    hostname: action-audit-service
+    ports:
+      - "${AUDIT_PORT:-8086}:8086"
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+      couchbase-init: {condition: service_completed_successfully}
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_GROUP: fraud-audit-group
+      CB_CONNECTION: couchbase://couchbase
+      CB_USER: ${CB_USER:-Administrator}
+      CB_PASSWORD: ${CB_PASSWORD:-password}
+      CB_BUCKET: ${CB_BUCKET:-fraud-detection}
+      MOCK_PAYMENT_URL: http://mock-payment-api:8080
+      JAVA_OPTS: >-
+        -XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Xss512k -XX:TieredStopAtLevel=1
+    # NO depends_on for mock-payment-api, deliberately. The webhook receiver's
+    # availability must never gate this service starting or acking - that is the
+    # same reason the offset commit happens BEFORE webhook delivery.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8086/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    mem_limit: 320m
+    networks: [fraud-net]
+
   gateway-service:
     build:
       context: ./gateway-service

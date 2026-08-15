@@ -1,0 +1,77 @@
+spring:
+  application:
+    name: action-audit-service
+
+
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+    consumer:
+      group-id: ${KAFKA_GROUP:fraud-audit-group}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # NEVER auto-commit (§9.6). Auto-commit fires on a wall-clock timer,
+      # decoupled from whether the work succeeded — a crash between the commit
+      # and the downstream publish loses the message SILENTLY rather than
+      # redelivering it.
+      enable-auto-commit: false
+      properties:
+        # Explicit, on every consumer group (§9.5). With the default eager
+        # assignor ANY rebalance revokes ALL partitions from ALL members — the
+        # whole group stops, including partitions nobody was going to move.
+        # ALL members must agree: a mixed group falls back to eager, so one
+        # misconfigured instance degrades the entire group.
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+    listener:
+      ack-mode: MANUAL_IMMEDIATE
+      concurrency: ${KAFKA_CONCURRENCY:3}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        delivery.timeout.ms: 4000
+        request.timeout.ms: 2000
+
+couchbase:
+  connection-string: ${CB_CONNECTION:couchbase://localhost}
+  username: ${CB_USER:Administrator}
+  password: ${CB_PASSWORD:password}
+  bucket: ${CB_BUCKET:fraud-detection}
+
+fraud:
+  topics:
+    decisioned: fraud.transactions.decisioned
+    actioned: fraud.transactions.actioned
+    alerts: fraud.alerts.realtime
+  service-version: 1.0.0
+  webhook:
+    base-url: ${MOCK_PAYMENT_URL:http://localhost:8080}
+    timeout-ms: 2000
+
+
+server:
+  port: 8086
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      service: ${spring.application.name}
+
+logging:
+  structured:
+    format:
+      console: ecs
+  level:
+    com.fraud.audit: INFO
+    com.couchbase.client: WARN
