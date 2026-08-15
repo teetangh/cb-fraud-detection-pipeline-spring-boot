@@ -74,6 +74,22 @@ public class ScoredTransactionListener {
 
         try {
             DecisionPolicy policy = policyCache.policy();
+            if (policy == null) {
+                // No policy has loaded yet — PolicyCache.policy starts null and is
+                // only ever populated by a refresh. This is reachable in
+                // practice: a restart with an unacked backlog on
+                // fraud.transactions.scored (exactly the redelivery scenario
+                // manual-ack exists to make safe) can have Kafka deliver a
+                // message before the first scheduled refresh completes against
+                // Couchbase. Refuse to decide rather than NPE or invent a
+                // default — the record is left unacknowledged so it is
+                // redelivered once a policy is loaded (§9.8's fail-closed spirit
+                // applied to "no policy" the same way it applies to "no answer
+                // in time").
+                throw new IllegalStateException(
+                        "No decision policy loaded yet — refusing to decide (fail-closed, not "
+                        + "fail-open) transactionId=" + transactionId);
+            }
             int riskScore = scored.path("riskScore").asInt();
             Decision decision = policy.apply(riskScore);
 
