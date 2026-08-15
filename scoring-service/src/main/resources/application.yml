@@ -64,6 +64,16 @@ management:
     health:
       probes:
         enabled: true
+      # Spring Boot does NOT add custom HealthIndicator beans to the readiness
+      # group by default (only readinessState is included) — confirmed against
+      # the Boot 4.1 actuator reference. Without this, ScoringReadinessIndicator
+      # (bean name "ruleset") is never consulted by
+      # /actuator/health/readiness, the docker-compose healthcheck reports UP
+      # the moment the context starts, and the whole point of gating traffic on
+      # "a ruleset has loaded at least once" silently does nothing.
+      group:
+        readiness:
+          include: readinessState,ruleset
   metrics:
     tags:
       service: ${spring.application.name}

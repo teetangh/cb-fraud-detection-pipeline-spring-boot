@@ -146,4 +146,54 @@ class RuleEvaluatorTest {
                 () -> RuleOperator.parse("NOT_AN_OPERATOR", BigDecimal.ONE)).getMessage())
                 .contains("Unknown rule operator");
     }
+
+    @Test
+    @DisplayName("a missing threshold on a threshold-based operator is rejected at parse time, "
+                 + "not left to NullPointerException deep in scoring")
+    void missingThresholdRejectedAtParseTime() {
+        assertThat(org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RuleOperator.parse("GREATER_THAN", null)).getMessage())
+                .contains("requires a numeric threshold");
+
+        // BOOLEAN_TRUE is the one operator allowed to omit it.
+        assertThat(RuleOperator.parse("BOOLEAN_TRUE", null)).isInstanceOf(RuleOperator.BooleanTrue.class);
+    }
+
+    @Test
+    @DisplayName("score is CLAMPED at 0 — a hand-edited negative weight must not push the score "
+                 + "below the documented floor")
+    void scoreClampsNegativeWeightToZero() {
+        FraudRule negativeWeight = rule("TYPO_WEIGHT", SignalKey.VELOCITY_1M, "GREATER_THAN", "5", -30);
+
+        ScoreResult result = evaluator.score(Map.of(SignalKey.VELOCITY_1M, 6), List.of(negativeWeight));
+        assertThat(result.triggeredRules()).singleElement()
+                .satisfies(t -> assertThat(t.contribution()).isEqualTo(-30));
+        assertThat(result.riskScore())
+                .as("the raw contribution is negative, but the reported score must stay in 0-100")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("a rule/signal type mismatch costs ONE rule, not the whole transaction's score")
+    void nonNumericSignalValueDoesNotAbortScoring() {
+        // A numeric operator pointed at a non-numeric value — e.g. after a rule
+        // edit or an enrichment change puts a String where a number was
+        // expected. This must NOT throw: the previous behaviour aborted
+        // score() entirely, which zeroed out every OTHER rule's contribution
+        // too and, via the listener, could stall the Kafka partition.
+        FraudRule mismatched = rule("BAD_TYPE", SignalKey.AMOUNT_VS_P90_RATIO, "GREATER_THAN", "3", 20);
+        FraudRule stillFires = rule("VELOCITY_1M", SignalKey.VELOCITY_1M, "GREATER_THAN", "5", 30);
+
+        Map<String, Object> signals = Map.of(
+                SignalKey.AMOUNT_VS_P90_RATIO, "not-a-number",
+                SignalKey.VELOCITY_1M, 6);
+
+        ScoreResult result = evaluator.score(signals, List.of(mismatched, stillFires));
+
+        assertThat(result.triggeredRules()).extracting(t -> t.ruleId()).containsExactly("VELOCITY_1M");
+        assertThat(result.riskScore())
+                .as("the mismatched rule contributes nothing, but the well-formed rule still scores")
+                .isEqualTo(30);
+    }
 }

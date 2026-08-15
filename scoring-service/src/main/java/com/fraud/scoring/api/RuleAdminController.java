@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -72,15 +73,29 @@ public class RuleAdminController {
                 "rules", rules));
     }
 
+    /**
+     * {@code Map.of} throws {@code NullPointerException} on any null key or
+     * value. {@code category} (and in principle {@code signalKey}) come
+     * straight from an analyst-edited Couchbase document and can be null on a
+     * document that omits the field — exactly the malformed-rule case this
+     * endpoint's whole purpose is to surface. A null-tolerant map keeps the
+     * endpoint answering instead of 500-ing on the very rule it exists to
+     * diagnose.
+     */
     private Map<String, Object> describe(FraudRule r) {
-        return Map.of(
-                "ruleId", r.ruleId(),
-                "signalKey", r.signalKey(),
-                "signalKeyValid", signalRegistry.contains(r.signalKey()),
-                "operator", r.operator().name(),
-                "threshold", String.valueOf(r.operator().thresholdOrNull()),
-                "weight", r.weight(),
-                "category", r.category(),
-                "version", r.version());
+        Map<String, Object> described = new LinkedHashMap<>();
+        described.put("ruleId", r.ruleId());
+        described.put("signalKey", r.signalKey());
+        // signalRegistry is built with Set.of(...), whose contains(null)
+        // throws NullPointerException rather than returning false — so a
+        // null signalKey (another malformed-document case) is guarded
+        // explicitly instead of being handed to it.
+        described.put("signalKeyValid", r.signalKey() != null && signalRegistry.contains(r.signalKey()));
+        described.put("operator", r.operator().name());
+        described.put("threshold", String.valueOf(r.operator().thresholdOrNull()));
+        described.put("weight", r.weight());
+        described.put("category", r.category());
+        described.put("version", r.version());
+        return described;
     }
 }
