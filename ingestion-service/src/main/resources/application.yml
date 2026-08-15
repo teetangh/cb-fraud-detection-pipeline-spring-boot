@@ -30,6 +30,23 @@ spring:
         # the topic rather than a delay.
         delivery.timeout.ms: 4000
         request.timeout.ms: 2000
+        # Bounds send() ITSELF, which the two timeouts above do not.
+        #
+        # KafkaProducer.send() blocks in waitOnMetadata (and on buffer
+        # exhaustion) BEFORE it returns the future, so the publisher's
+        # .get(ACK_TIMEOUT_SECONDS, ...) has nothing to time out on yet. At
+        # Kafka's default of 60s that makes the worst-case wall clock through
+        # OutboxPublisher.publish() 60s + 5s + ~2.5s (markPublished) — well past
+        # OutboxPublisher.CLAIM_STALE_AFTER (30s).
+        #
+        # That is a real duplicate, not a delay: a broker restart blocks the
+        # first publisher in send(), its claim expires at 30s, the poll reclaims
+        # the row believing the publisher died, and when the broker returns BOTH
+        # sends land. enable.idempotence does not help — it dedups retries of one
+        # batch, not two independent send() calls. So the claim's staleness
+        # window is only sound if publish() is bounded well inside it:
+        #   5s (this) + 5s (ack wait) + ~2.5s (markPublished) = ~12.5s << 30s.
+        max.block.ms: 5000
 
 couchbase:
   connection-string: ${CB_CONNECTION:couchbase://localhost}

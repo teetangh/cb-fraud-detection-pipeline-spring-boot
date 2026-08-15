@@ -121,6 +121,24 @@ SELECT COUNT(*) FROM `fraud-detection`.`transactions`.`outbox` WHERE status = "P
 publisher is enabled (`outbox.publisher.enabled` — the [T4](TEST_PLAN.md#t4) test hook, which must
 never be `false` in a real run) and check producer errors in the ingestion logs.
 
+**What you should NOT see, and what it means if you do:**
+
+```
+WARN  Reclaiming outboxId=... — claim from ... is older than PT30S;
+      the previous publisher probably died mid-publish
+```
+
+Each publish takes a CAS claim on the row first, so exactly one publisher sends it
+([ADR-0005](adr/0005-transactional-outbox.md)). This WARN is the claim being taken from a publisher
+that is presumed dead. During a Kafka outage it should stay silent: `max.block.ms` (5s) bounds a
+blocked `send()` so a publish cannot outlive its own 30s claim. A burst of these *during* an outage
+means that bound has been raised or removed, and the reclaimed rows are being published **twice** —
+once by the reclaiming publisher and once by the original when the broker returns. Check the
+producer timeouts against `OutboxPublisher.CLAIM_STALE_AFTER` before doing anything else.
+
+A steady non-zero `fraud_ingestion_outbox_stale_skipped` is unrelated and healthy: it counts
+publishers that correctly stood down because another one held the row.
+
 ---
 
 ## Symptom: Couchbase is down

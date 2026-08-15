@@ -41,12 +41,29 @@ public class OutboxPublisher {
      * How long a publish claim is honoured before another publisher may take the
      * row (issue #12).
      *
-     * <p>Comfortably above {@link #ACK_TIMEOUT_SECONDS}. If it were below, a
-     * publish that is merely slow — not dead — would be reclaimed underneath
-     * itself and republished, manufacturing the duplicate the claim exists to
-     * prevent. The cost of erring high is only that a genuinely crashed
-     * publisher's rows wait this long before retry; the cost of erring low is a
-     * correctness bug.
+     * <p>Comfortably above the worst-case duration of {@link #publish}. If it
+     * were below, a publish that is merely slow — not dead — would be reclaimed
+     * underneath itself and republished, manufacturing the duplicate the claim
+     * exists to prevent. The cost of erring high is only that a genuinely
+     * crashed publisher's rows wait this long before retry; the cost of erring
+     * low is a correctness bug.
+     *
+     * <p>"Worst case" is <b>not</b> {@link #ACK_TIMEOUT_SECONDS} on its own, and
+     * reading it that way is how this window gets set too low. That timeout
+     * bounds the wait on the ack future; it does not bound
+     * {@code KafkaProducer.send()}, which blocks in {@code waitOnMetadata}
+     * before the future exists. The real bound is the sum, and it holds only
+     * because {@code max.block.ms} is pinned to 5s in {@code application.yml}:
+     *
+     * <pre>
+     *   5.0s  max.block.ms          send() blocking on metadata / buffer
+     * + 5.0s  ACK_TIMEOUT_SECONDS   waiting on the broker ack
+     * + 2.5s  markPublished         Couchbase KV default timeout
+     * = 12.5s                       against a 30s claim
+     * </pre>
+     *
+     * <p>Change either constant, or unpin {@code max.block.ms}, and that margin
+     * is what has to be rechecked.
      */
     private static final Duration CLAIM_STALE_AFTER = Duration.ofSeconds(30);
 
@@ -83,9 +100,16 @@ public class OutboxPublisher {
 
         this.publishedCounter = Counter.builder("fraud.ingestion.outbox.published")
                 .register(meterRegistry);
-        // Rows the GSI still reported as PENDING that the nudge had already
-        // published. Expected to be non-zero in normal operation — it is the
-        // index lag being absorbed, not an error.
+        // Publish attempts that correctly stood down because another publisher
+        // owned the row: it was already PUBLISHED (the GSI-lag case), it carried
+        // a live claim, or this caller lost the CAS race. Expected to be non-zero
+        // in normal operation — it is contention being absorbed, not an error.
+        //
+        // Deliberately one counter and not three: all three mean the same thing
+        // operationally ("someone else has it, we did not double-publish"). The
+        // event that IS worth distinguishing — reclaiming a dead publisher's row
+        // — is logged at WARN by OutboxRepository.claim rather than folded in
+        // here, because it means a publisher died, not that two of them raced.
         this.staleSkipCounter = Counter.builder("fraud.ingestion.outbox.stale_skipped")
                 .register(meterRegistry);
         this.failedCounter = Counter.builder("fraud.ingestion.outbox.publish.failed")
@@ -113,41 +137,43 @@ public class OutboxPublisher {
     /**
      * Non-reentrant: only one poll runs at a time.
      *
-     * <p>This guard is load-bearing. Two callers invoke this method — the
-     * scheduled timer and the post-commit nudge — and without it they race: both
-     * read the same PENDING row before either has marked it PUBLISHED, and the
-     * transaction is published to Kafka TWICE.
+     * <p><b>This is an efficiency guard, not the correctness mechanism</b> — and
+     * the distinction is the whole of issue #12. It keeps two callers of
+     * <em>this method</em> from doing the same {@code findPending} + publish work
+     * concurrently. It has never constrained the post-commit nudge at all:
+     * {@link #onCommitted} calls {@link #publish} directly and does not route
+     * through here. So the flag could not have been what stopped the
+     * double-publish, which is exactly why T3 kept failing intermittently while
+     * this comment claimed the race was closed.
      *
-     * <p>That is not a benign at-least-once duplicate. Enrichment's velocity
-     * counter is the one piece of state that is not idempotent under redelivery,
-     * so a systematic double-publish would double every customer's velocity
-     * count — inflating a signal that gets people's payments blocked. T3 caught
-     * exactly this.
+     * <p>What actually guarantees one publisher per row is the CAS claim on the
+     * row itself ({@link OutboxRepository#claim}). That holds across threads,
+     * across the nudge/poll split, and across ingestion instances — none of
+     * which this flag can reach.
+     *
+     * <p>The duplicate being prevented is not a benign at-least-once one.
+     * Enrichment's velocity counter is the one piece of state that is not
+     * idempotent under redelivery, so a systematic double-publish would double
+     * every customer's velocity count — inflating a signal that gets people's
+     * payments blocked.
      *
      * <p>Skipping (rather than queueing) is correct: the nudge is only a latency
      * optimisation, and the timer is the correctness backstop, so a dropped
      * nudge costs at most one poll interval.
      *
-     * <p>NOTE: this makes publishing safe within one process. Multiple ingestion
-     * instances polling concurrently could still double-publish; closing that
-     * needs a CAS claim on the outbox row before publishing. Not done here
-     * because ingestion runs single-instance in this build — recorded so the
-     * limit is a known one rather than a surprise.
-     *
-     * <p>NOTE: a second, narrower window remains even single-instance: if
+     * <p>NOTE: one at-least-once window remains, and is accepted. If
      * {@code publish()}'s ack {@code .get(ACK_TIMEOUT_SECONDS, ...)} times out
      * while the broker actually accepted the send, or {@code markPublished}
-     * itself fails after a successful ack, the row stays PENDING and the next
-     * tick republishes — a genuine duplicate on the topic, not just delay. This
-     * is the same general class of at-least-once duplicate ADR-0005 already
-     * accepts ("a crash after the Kafka ack but before the PUBLISHED update
-     * re-publishes on restart... duplicates are absorbed... by consumers keyed
-     * on transactionId"), not the systematic every-time race this guard closes
-     * above. Fully closing it needs the same CAS-claim mechanism as the
-     * cross-instance case, plus a stable dedup key consumed by
-     * enrichment-service (not yet built — Phase 3) before the velocity counter
-     * increments. Tracked in
-     * <a href="https://github.com/teetangh/cb-fraud-detection-pipeline-spring-boot/issues/12">issue #12</a>.
+     * itself fails after a successful ack, the row stays PENDING, its claim is
+     * released, and the next tick republishes — a genuine duplicate on the
+     * topic. {@code delivery.timeout.ms} (4s) is pinned below
+     * {@code ACK_TIMEOUT_SECONDS} (5s) precisely to narrow it: the producer gives
+     * up before the publisher does, so a timed-out send is usually a genuinely
+     * failed one. What is left is the ordinary at-least-once duplicate ADR-0005
+     * already accepts ("a crash after the Kafka ack but before the PUBLISHED
+     * update re-publishes on restart... duplicates are absorbed... by consumers
+     * keyed on transactionId") — not the systematic every-time race the claim
+     * closes.
      */
     private final java.util.concurrent.atomic.AtomicBoolean polling =
             new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -199,14 +225,33 @@ public class OutboxPublisher {
         try {
             List<OutboxEvent> pending = outboxRepository.findPending(BATCH_SIZE);
             for (OutboxEvent event : pending) {
-                // CLAIM before publishing, never merely check.
-                //
-                // findPending reads a GSI that lags ~195ms, so a row the nudge has
-                // already published still shows up here as PENDING. A re-read
-                // would confirm that truthfully and publish it anyway — both
-                // parties observe PENDING because neither has acked yet. The
-                // claim is atomic, so exactly one of them proceeds (issue #12).
-                if (!outboxRepository.claim(event.outboxId(), CLAIM_STALE_AFTER)) {
+                boolean claimed;
+                try {
+                    // CLAIM before publishing, never merely check.
+                    //
+                    // findPending reads a GSI that lags ~195ms, so a row the nudge
+                    // has already published still shows up here as PENDING. A
+                    // re-read would confirm that truthfully and publish it anyway
+                    // — both parties observe PENDING because neither has acked
+                    // yet. The claim is atomic, so exactly one proceeds (#12).
+                    claimed = outboxRepository.claim(event.outboxId(), CLAIM_STALE_AFTER);
+                } catch (Exception e) {
+                    // Isolate the ROW, not the batch.
+                    //
+                    // claim() is the only call in this loop that can throw —
+                    // publish() handles its own failures. findPending is
+                    // ORDER BY createdAt ASC, so letting an exception escape here
+                    // would abort the drain at the OLDEST failing row on every
+                    // single tick, and every row behind it would stop draining.
+                    // Permanently, and silently: no counter moves, and the only
+                    // symptom is this line repeating. A row that cannot be
+                    // claimed is simply retried next tick; a row that cannot be
+                    // claimed AND takes the backlog with it is an outage.
+                    log.error("Claim failed for outboxId={}; skipping this row, the batch "
+                              + "continues", event.outboxId(), e);
+                    continue;
+                }
+                if (!claimed) {
                     staleSkipCounter.increment();
                     continue;
                 }
