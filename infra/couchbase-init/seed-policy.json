@@ -1,0 +1,9 @@
+[
+  {
+    "docType": "DECISION_POLICY",
+    "policyVersion": "v1",
+    "allowBelow": 30,
+    "blockAtOrAbove": 70,
+    "description": "Score < 30 ALLOW, 30-69 REVIEW, >= 70 BLOCK. Owned by decision-service and deliberately separate from the ruleset owned by scoring-service, so an auditor reviewing a historical decision can tell whether the model changed or the policy changed (ADR-0008). Invariant enforced on load: 0 <= allowBelow <= blockAtOrAbove <= 100 - an inverted policy makes BLOCK unreachable and silently allows everything."
+  }
+]

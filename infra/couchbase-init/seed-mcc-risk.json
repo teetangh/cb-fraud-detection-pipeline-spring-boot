@@ -1,0 +1,12 @@
+[
+  { "docType": "MCC_RISK", "mcc": "5967", "description": "Direct marketing - inbound teleservices", "riskScore": 85 },
+  { "docType": "MCC_RISK", "mcc": "7995", "description": "Betting, casino gaming chips, lottery", "riskScore": 95 },
+  { "docType": "MCC_RISK", "mcc": "6051", "description": "Quasi-cash - money orders, crypto, foreign currency", "riskScore": 90 },
+  { "docType": "MCC_RISK", "mcc": "4829", "description": "Money transfer / wire", "riskScore": 88 },
+  { "docType": "MCC_RISK", "mcc": "5944", "description": "Jewelry, watches, silverware", "riskScore": 65 },
+  { "docType": "MCC_RISK", "mcc": "5732", "description": "Electronics stores", "riskScore": 55 },
+  { "docType": "MCC_RISK", "mcc": "5999", "description": "Miscellaneous retail", "riskScore": 40 },
+  { "docType": "MCC_RISK", "mcc": "5812", "description": "Eating places and restaurants", "riskScore": 20 },
+  { "docType": "MCC_RISK", "mcc": "5411", "description": "Grocery stores and supermarkets", "riskScore": 10 },
+  { "docType": "MCC_RISK", "mcc": "5541", "description": "Service stations", "riskScore": 15 }
+]

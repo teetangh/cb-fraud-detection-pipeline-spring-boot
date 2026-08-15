@@ -308,7 +308,7 @@ curl -s localhost:8080/actuator/prometheus | grep payment_fraud_latency
 **Warm up first.** The first ~50 requests include JIT and connection-pool warmup and will look
 terrible. Also note the Compose config sets `-XX:TieredStopAtLevel=1` to save memory, which
 disables the C2 compiler — **remove it before quoting p99 numbers**, or you are measuring the JIT
-setting rather than the design ([LLD §8](LLD.md#8-resource-footprint)).
+setting rather than the design ([LLD §9](LLD.md#9-resource-footprint)).
 
 ---
 

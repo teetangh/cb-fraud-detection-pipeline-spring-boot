@@ -45,3 +45,6 @@ volumes/
 
 # Terminal transcript saved from another session; content lives in docs/INTERVIEW_PREP.md
 services.txt
+
+# Scratch output from other agent sessions; not part of the build
+temp/
