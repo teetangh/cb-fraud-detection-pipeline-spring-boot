@@ -107,6 +107,21 @@ public class OutboxPublisher {
      * needs a CAS claim on the outbox row before publishing. Not done here
      * because ingestion runs single-instance in this build — recorded so the
      * limit is a known one rather than a surprise.
+     *
+     * <p>NOTE: a second, narrower window remains even single-instance: if
+     * {@code publish()}'s ack {@code .get(ACK_TIMEOUT_SECONDS, ...)} times out
+     * while the broker actually accepted the send, or {@code markPublished}
+     * itself fails after a successful ack, the row stays PENDING and the next
+     * tick republishes — a genuine duplicate on the topic, not just delay. This
+     * is the same general class of at-least-once duplicate ADR-0005 already
+     * accepts ("a crash after the Kafka ack but before the PUBLISHED update
+     * re-publishes on restart... duplicates are absorbed... by consumers keyed
+     * on transactionId"), not the systematic every-time race this guard closes
+     * above. Fully closing it needs the same CAS-claim mechanism as the
+     * cross-instance case, plus a stable dedup key consumed by
+     * enrichment-service (not yet built — Phase 3) before the velocity counter
+     * increments. Tracked in
+     * <a href="https://github.com/teetangh/cb-fraud-detection-pipeline-spring-boot/issues/12">issue #12</a>.
      */
     private final java.util.concurrent.atomic.AtomicBoolean polling =
             new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -121,7 +136,13 @@ public class OutboxPublisher {
         }
         try {
             List<OutboxEvent> pending = outboxRepository.findPending(BATCH_SIZE);
-            pendingGauge.set(pending.size());
+            // NOT pending.size(): findPending is capped at BATCH_SIZE, so that
+            // value can never exceed 100 and the gauge could never show the
+            // "monotonic climb" that ADR-0005 names as the earliest signal Kafka
+            // is unreachable. countPending() reports the true backlog and is
+            // backed by the same partial idx_outbox_pending index, so its cost
+            // already tracks the pending depth rather than total history.
+            pendingGauge.set(outboxRepository.countPending());
             for (OutboxEvent event : pending) {
                 publish(event);
             }
@@ -176,7 +197,14 @@ public class OutboxPublisher {
                       ack.getRecordMetadata().partition(), ack.getRecordMetadata().offset());
 
         } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                // Restore the flag we just swallowed by catching it — otherwise
+                // the scheduler/async thread loses its interrupt status and a
+                // shutdown signal delivered here is silently dropped.
+                Thread.currentThread().interrupt();
+            }
             failedCounter.increment();
+            sample.stop(publishLatency);
             // Left PENDING on purpose — the next tick retries it. Nothing is lost.
             log.error("Failed to publish outboxId={} transactionId={}; row stays PENDING and "
                       + "will be retried", event.outboxId(), event.payload().transactionId(), e);

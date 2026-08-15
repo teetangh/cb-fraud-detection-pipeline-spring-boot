@@ -33,6 +33,12 @@ public record TransactionRecord(
         @NotNull @DecimalMin(value = "0", inclusive = false, message = "amount must be > 0")
         BigDecimal amount,
 
+        // @NotBlank is required in addition to @Pattern: CONTRACTS.md §1 lists
+        // currency as a REQUIRED field in the fraud.transactions.raw JSON Schema,
+        // and @Pattern alone treats null as valid (Bean Validation constraints
+        // pass null unless a presence constraint says otherwise) — without
+        // @NotBlank a request could omit currency and still pass @Valid.
+        @NotBlank
         @Pattern(regexp = "^[A-Z]{3}$", message = "currency must be ISO 4217")
         String currency,
 

@@ -22,8 +22,14 @@ spring:
       properties:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5
-        delivery.timeout.ms: 10000
-        request.timeout.ms: 5000
+        # Both MUST stay below OutboxPublisher.ACK_TIMEOUT_SECONDS (5s). If the
+        # producer keeps retrying past the point where the publisher's
+        # .get(ACK_TIMEOUT_SECONDS, ...) gives up, the publisher declares the
+        # send failed and leaves the row PENDING for the next tick to retry —
+        # while the original send can still land, producing a real duplicate on
+        # the topic rather than a delay.
+        delivery.timeout.ms: 4000
+        request.timeout.ms: 2000
 
 couchbase:
   connection-string: ${CB_CONNECTION:couchbase://localhost}

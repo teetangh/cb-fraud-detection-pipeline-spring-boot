@@ -6,7 +6,7 @@ completes, within a hard 150ms budget — over a fully asynchronous Kafka backbo
 Everything runs locally on real infrastructure: real Kafka, real Redis, real Couchbase. No
 in-memory fakes, no cloud dependency, one `docker compose up`.
 
-> **Status: infra and the ingestion path are built and tested; four services remain.**
+> **Status: infra and the ingestion path are built and tested; six services remain.**
 > Phase 1 (infra + the Couchbase CE capability gate) and Phase 2a (`ingestion-service`, with
 > **T3 and T4 passing** against real Kafka/Redis/Couchbase) are done. Implementation follows the
 > phase order in [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt) — see
@@ -80,7 +80,8 @@ consumer is a tolerant reader. → [ADR-0002](docs/adr/0002-no-shared-dto-jar.md
 
 ## Quick start
 
-**Requirements:** Docker + Compose v2, Java 21, ~4.6 GB free RAM, ~4 GB free disk.
+**Requirements:** Docker + Compose v2, Java 21, `curl` + `jq` (for the example commands below),
+~4.6 GB free RAM, ~4 GB free disk.
 Maven is *not* required — each module ships a script-only Maven Wrapper (`./mvnw`), so nothing
 needs installing and nothing needs sudo.
 

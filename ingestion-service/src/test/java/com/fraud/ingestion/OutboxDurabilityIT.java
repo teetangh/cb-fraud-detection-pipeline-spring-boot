@@ -82,7 +82,10 @@ class OutboxDurabilityIT extends AbstractIngestionIT {
         // ── and NOTHING was published ────────────────────────────────────────
         // This negative assertion carries as much weight as the positive ones:
         // without it, the test would pass on a system that published eagerly and
-        // never used the outbox at all.
+        // never used the outbox at all. It depends on no OTHER live context
+        // running an enabled publisher against these same (static) containers —
+        // DuplicateIngestionIT's @DirtiesContext(AFTER_CLASS) is what guarantees
+        // that its enabled-publisher context is closed before this one runs.
         assertThat(drainMatching(RAW_TOPIC, transactionId))
                 .as("publisher is frozen, so no event may exist yet")
                 .isEmpty();
@@ -106,8 +109,19 @@ class OutboxDurabilityIT extends AbstractIngestionIT {
                 assertThat(outboxStatusOf(transactionId)).isEqualTo("PUBLISHED"));
     }
 
+    /**
+     * Returns {@code null}, not a thrown exception, when no row matches yet.
+     *
+     * <p>{@code Awaitility}'s {@code untilAsserted} only retries {@link
+     * AssertionError}. {@code List.getFirst()} on an empty result throws {@link
+     * java.util.NoSuchElementException}, which is not an {@code AssertionError}
+     * and would abort the retry loop immediately on the first empty read instead
+     * of waiting for the row to appear. Returning {@code null} lets the caller's
+     * {@code assertThat(...).isEqualTo("PENDING"/"PUBLISHED")} fail normally
+     * (an {@code AssertionError}, correctly retried) instead.
+     */
     private String outboxStatusOf(String transactionId) {
-        return cluster.query("""
+        List<String> rows = cluster.query("""
                         SELECT RAW o.status FROM `%s`.`transactions`.`outbox` o
                         WHERE o.payload.transactionId = $txnId
                         """.formatted(BUCKET),
@@ -116,6 +130,7 @@ class OutboxDurabilityIT extends AbstractIngestionIT {
                                 // Read-after-write: NOT_BOUNDED would legitimately
                                 // return nothing here (LLD §7).
                                 .scanConsistency(QueryScanConsistency.REQUEST_PLUS))
-                .rowsAs(String.class).getFirst();
+                .rowsAs(String.class);
+        return rows.isEmpty() ? null : rows.getFirst();
     }
 }

@@ -80,7 +80,7 @@ The exception is caught and treated as normal control flow:
     if (hasCause(e, DocumentExistsException.class)) {
         duplicateCounter.increment();
         log.debug("Duplicate suppressed transactionId={}", txn.transactionId());
-        return readExisting(txn.transactionId());   // same response as the original caller got
+        return readExisting(txn.transactionId());   // same identity; status=DUPLICATE
     }
     throw e;
 }
@@ -155,7 +155,7 @@ correctness comes from `insert()`. Redis being down degrades latency, never corr
 | Couchbase down | **503, reject.** Nothing is accepted that cannot be made durable — the one place this system fails closed, because accepting without durability is a lie. |
 | Redis down | Proceed. `insert()` still enforces idempotency. Slower, still correct. |
 | Kafka down | Commit succeeds, 202 returned, outbox accumulates `PENDING`, drains on recovery. **Nothing lost.** |
-| Duplicate `transactionId` | Cache hit or `DocumentExistsException` → identical response |
+| Duplicate `transactionId` | Cache hit or `DocumentExistsException` → same `transactionId` + `correlationId`, `status=DUPLICATE` |
 | Crash mid-transaction | Couchbase rolls back; client retries; `insert()` handles it |
 | Crash after commit, before publish | Row stays `PENDING`; republished on restart — [T4](../TEST_PLAN.md#t4) |
 

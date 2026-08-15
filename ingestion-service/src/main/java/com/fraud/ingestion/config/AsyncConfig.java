@@ -10,8 +10,15 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
  *
  * <p>Small and bounded on purpose: the nudge is a latency optimisation, and the
  * scheduled poll is the correctness backstop. If this queue saturates under
- * load, dropping nudges costs at most one poll interval of delay — so a caller
- * runs the task inline rather than the pool growing without limit.
+ * load, the nudge is DROPPED rather than queued further or run inline — a
+ * dropped nudge costs at most one poll interval of delay, which is the ~0ms
+ * hot-path contribution ADR-0005 promises. {@code CallerRunsPolicy} would
+ * instead run the outbox poll (up to {@code BATCH_SIZE} rows, each waiting up
+ * to {@code ACK_TIMEOUT_SECONDS} on a Kafka ack) on the ingest request thread
+ * that just committed the transaction, which is exactly the hot-path cost this
+ * design exists to avoid — so the policy must be {@link
+ * java.util.concurrent.ThreadPoolExecutor.DiscardPolicy}, not {@code
+ * CallerRunsPolicy}.
  */
 @Configuration
 @EnableAsync
@@ -24,7 +31,7 @@ public class AsyncConfig {
         executor.setMaxPoolSize(2);
         executor.setQueueCapacity(50);
         executor.setThreadNamePrefix("outbox-nudge-");
-        executor.setRejectedExecutionHandler(new java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setRejectedExecutionHandler(new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy());
         executor.initialize();
         return executor;
     }

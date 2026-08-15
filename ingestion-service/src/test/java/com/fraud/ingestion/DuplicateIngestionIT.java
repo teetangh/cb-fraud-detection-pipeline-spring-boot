@@ -12,6 +12,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.annotation.DirtiesContext;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -39,6 +40,15 @@ import static org.awaitility.Awaitility.await;
  */
 @SpringBootTest(properties = "outbox.publisher.enabled=true")
 @DisplayName("T3 — duplicate request idempotency")
+// Spring caches contexts across test classes, keyed by config — so this
+// context (publisher ENABLED) and OutboxDurabilityIT's (publisher DISABLED)
+// are cached side by side, both alive, both pointed at the same static
+// Kafka/Redis/Couchbase containers. Left alone, this context's live
+// @Scheduled poller could drain a row OutboxDurabilityIT expects to observe
+// as PENDING. AFTER_CLASS closes this context (and its poller) once this
+// class's tests finish, before OutboxDurabilityIT's disabled-publisher
+// context is ever created.
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class DuplicateIngestionIT extends AbstractIngestionIT {
 
     @Autowired TransactionIngestor ingestor;

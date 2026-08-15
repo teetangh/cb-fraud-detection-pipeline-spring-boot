@@ -53,8 +53,17 @@ the moment of the write.
 - `DocumentExistsException` is **normal control flow**, not an error. It is logged at DEBUG and
   counted, never logged at ERROR — a duplicate-suppression counter is a health signal, an ERROR
   log is noise that trains people to ignore logs.
-- Both duplicate callers receive the *same* response, including the same `correlationId`, so the
-  decision they act on is identical.
+- Both duplicate callers receive the same **decision-relevant** fields — `transactionId` and
+  `correlationId` — so the identity they act on is identical and both will be woken by the same
+  `decision:{correlationId}` publication.
+
+  The `status` field deliberately differs: the winner gets `ACCEPTED`, the loser `DUPLICATE`.
+  That is not a violation of §9.1. §9.1 is about not *reprocessing* a duplicate and not emitting a
+  second Kafka event; T3 asserts exactly one `ACCEPTED` and one `DUPLICATE` precisely because
+  distinguishing them is useful — it is what makes duplicate suppression observable at the caller
+  rather than only in a counter. The fraud *decision* — the thing spec §10 T3 requires both callers
+  to receive identically — does not exist yet at ingestion time; it arrives later via the gateway's
+  Pub/Sub wait, keyed by the `correlationId` both callers share.
 
 ## Verified by
 
