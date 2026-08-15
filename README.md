@@ -6,10 +6,11 @@ completes, within a hard 150ms budget — over a fully asynchronous Kafka backbo
 Everything runs locally on real infrastructure: real Kafka, real Redis, real Couchbase. No
 in-memory fakes, no cloud dependency, one `docker compose up`.
 
-> **Status: documentation and design complete; services not yet implemented.**
-> This repository currently contains the build specification, the full design set (HLD, LLD, 14
-> ADRs, contracts, test plan, runbook), and the backlog. Implementation follows the phase order in
-> [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt). See [Build status](#build-status).
+> **Status: infra and the ingestion path are built and tested; six services remain.**
+> Phase 1 (infra + the Couchbase CE capability gate) and Phase 2a (`ingestion-service`, with
+> **T3 and T4 passing** against real Kafka/Redis/Couchbase) are done. Implementation follows the
+> phase order in [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt) — see
+> [Build status](#build-status) for exactly what is and is not built.
 
 ---
 
@@ -79,7 +80,8 @@ consumer is a tolerant reader. → [ADR-0002](docs/adr/0002-no-shared-dto-jar.md
 
 ## Quick start
 
-**Requirements:** Docker + Compose v2, Java 21, ~4.6 GB free RAM, ~4 GB free disk.
+**Requirements:** Docker + Compose v2, Java 21, `curl` + `jq` (for the example commands below),
+~4.6 GB free RAM, ~4 GB free disk.
 Maven is *not* required — each module ships a script-only Maven Wrapper (`./mvnw`), so nothing
 needs installing and nothing needs sudo.
 
@@ -89,9 +91,19 @@ docker compose up -d          # infra + init jobs today (Phase 1); brings up all
 ./scripts/smoke-test.sh       # exercises every scenario, prints PASS/FAIL per scenario
 ```
 
-**Right now (Phase 1)** `docker compose up -d` brings up Kafka, Redis, Couchbase and the two init
-jobs — five containers. The seven application services join `docker-compose.yml` as their phases
-land; `smoke-test.sh` needs them to be present to do anything useful.
+**Right now** `docker compose up -d` brings up Kafka, Redis, Couchbase, the two init jobs and
+`ingestion-service` — six containers. The remaining six application services join
+`docker-compose.yml` as their phases land; `smoke-test.sh` needs them to be present to do anything
+useful. You can exercise ingestion directly today:
+
+```bash
+curl -s -X POST localhost:8082/internal/v1/ingest -H 'Content-Type: application/json' \
+  -d '{"transactionId":"txn-demo-1","customerId":"cust-1","merchantId":"merch-1",
+       "merchantCategoryCode":"5411","amount":150.00,"currency":"INR","countryCode":"IN",
+       "deviceId":"dev-1","paymentMethod":"CARD","correlationId":"demo-corr-1"}' | jq
+# => 202 {"transactionId":"txn-demo-1","correlationId":"demo-corr-1","status":"ACCEPTED"}
+# repeat the same command => status becomes DUPLICATE, and no second Kafka event is produced
+```
 
 Init containers create the 9 Kafka topics, the Couchbase bucket / 3 scopes / 7 collections, the
 N1QL indexes and the 8 seed rules automatically. There are no manual setup steps.
@@ -306,7 +318,8 @@ Built in the phase order of spec §12, each phase gated on its acceptance tests.
 |---|---|---|---|
 | — | Design, contracts, ADRs, backlog | — | ✅ Done |
 | 1 | Infra skeleton + init jobs | Topics, bucket, seed rules, **CE transaction probe** | ✅ Done |
-| 2 | Ingestion path + outbox | T3, T4 | ⬜ |
+| 2a | `ingestion-service` + outbox | **T3, T4** | ✅ Done |
+| 2b | `mock-payment-api` + gateway skeleton | full sync chain | ⬜ |
 | 3 | Enrichment + scoring | T2, T8, Lua concurrency | ⬜ |
 | 4 | Decision + sync facade | T1, T6, T7a | ⬜ |
 | 5 | Action, audit, reconciliation | T7b, T9, T10 | ⬜ |

@@ -1,0 +1,76 @@
+spring:
+  application:
+    name: ingestion-service
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # Short on purpose. Redis is an optimisation here, not the authority, so a
+      # hung Redis must cost a few milliseconds rather than the caller's budget.
+      timeout: 200ms
+      connect-timeout: 200ms
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # acks=all is a no-op against one broker with RF=1 (ADR-0013). It is set
+      # anyway so the configuration is already correct when the topology changes.
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        # Both MUST stay below OutboxPublisher.ACK_TIMEOUT_SECONDS (5s). If the
+        # producer keeps retrying past the point where the publisher's
+        # .get(ACK_TIMEOUT_SECONDS, ...) gives up, the publisher declares the
+        # send failed and leaves the row PENDING for the next tick to retry —
+        # while the original send can still land, producing a real duplicate on
+        # the topic rather than a delay.
+        delivery.timeout.ms: 4000
+        request.timeout.ms: 2000
+
+couchbase:
+  connection-string: ${CB_CONNECTION:couchbase://localhost}
+  username: ${CB_USER:Administrator}
+  password: ${CB_PASSWORD:password}
+  bucket: ${CB_BUCKET:fraud-detection}
+
+fraud:
+  topics:
+    raw: fraud.transactions.raw
+
+outbox:
+  poll-interval-ms: 200
+  # MUST be true in any real run. Setting it false freezes the publisher after
+  # the Couchbase commit and before the Kafka publish — the T4 test hook.
+  publisher:
+    enabled: true
+
+server:
+  port: 8082
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+  metrics:
+    tags:
+      service: ${spring.application.name}
+
+logging:
+  # Native structured logging, Spring Boot 3.4+. No custom Logback encoder
+  # needed for the spec §11 JSON requirement (ADR-0001).
+  structured:
+    format:
+      console: ecs
+  level:
+    com.fraud.ingestion: INFO
+    com.couchbase.client: WARN
