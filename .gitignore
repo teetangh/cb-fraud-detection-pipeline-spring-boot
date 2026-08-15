@@ -48,3 +48,6 @@ services.txt
 
 # Scratch output from other agent sessions; not part of the build
 temp/
+
+# Agent worktrees (PR agents run isolated; see .github/AGENT_WORKFLOW.md)
+.claude/worktrees/
