@@ -57,9 +57,22 @@ retry() {
   done
 }
 
+# /pools returns 200 anonymously on a FRESH node but 401 once the cluster has
+# been initialised (same fact the docker-compose healthcheck already accounts
+# for). A plain `curl -sf` treats 401 as failure, so this unauthenticated
+# reachability probe — the very first thing the script does, before it knows
+# whether this is a first boot or a re-run against an already-initialised
+# volume — would FATAL on every run after the first. The question here is
+# only "is the REST API answering", not "does it return 200".
+rest_reachable() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${REST}/pools")
+  [ "${code}" = "200" ] || [ "${code}" = "401" ]
+}
+
 # ─────────────────────────────────────────────────────────────────────────
 log "Waiting for Couchbase REST at ${REST}..."
-retry 60 2 "rest" curl -sf "${REST}/pools" \
+retry 60 2 "rest" rest_reachable \
   || fail "Couchbase REST never became reachable."
 log "REST reachable."
 

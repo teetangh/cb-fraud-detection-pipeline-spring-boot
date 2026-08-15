@@ -85,9 +85,13 @@ needs installing and nothing needs sudo.
 
 ```bash
 ./scripts/preflight.sh        # checks RAM, disk and host ports; fails loudly rather than mid-build
-docker compose up -d          # infra, init jobs, then all 7 services
+docker compose up -d          # infra + init jobs today (Phase 1); brings up all 7 services once later phases land
 ./scripts/smoke-test.sh       # exercises every scenario, prints PASS/FAIL per scenario
 ```
+
+**Right now (Phase 1)** `docker compose up -d` brings up Kafka, Redis, Couchbase and the two init
+jobs — five containers. The seven application services join `docker-compose.yml` as their phases
+land; `smoke-test.sh` needs them to be present to do anything useful.
 
 Init containers create the 9 Kafka topics, the Couchbase bucket / 3 scopes / 7 collections, the
 N1QL indexes and the 8 seed rules automatically. There are no manual setup steps.
