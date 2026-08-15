@@ -176,6 +176,59 @@ Requires the group to be stopped. Skipping means that transaction is never score
 
 ---
 
+## Symptom: healthy container, absent consumer — everything stalls behind one service
+
+Seen once during the T10 investigation (PR #22): `enrichment-service` silently dropped out of
+`fraud-enrichment-group` while `/actuator/health/readiness` kept reporting `UP`. No consumer was
+assigned to the group, so nothing downstream of enrichment ever received another message — every
+transaction after the drop timed out to `REVIEW`/`TIMEOUT_DEFAULT`, indistinguishable from the
+Pub/Sub race in the symptom above except that here the pipeline is not just slow, it has actually
+stopped. A restart fixed it and it has not reliably recurred, so the root cause is still open —
+tracked in [issue #24](https://github.com/teetangh/cb-fraud-detection-pipeline-spring-boot/issues/24).
+
+**Why liveness and readiness both miss this:** both probes check that the JVM and its HTTP server
+are up, not that the Kafka consumer thread is still alive and assigned. A consumer that has quietly
+left its group (client-side crash inside the consumer thread, an unhandled exception escaping
+`poll()`, or a rebalance that never re-assigns it) leaves the rest of the container - and its
+health endpoint - completely unaffected. This is the same class of gap as the Pub/Sub
+subscribe-before-ingest race above: **the component that is broken is not the component the
+healthcheck is watching.**
+
+### Check first
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group fraud-enrichment-group
+```
+
+A `CONSUMER-ID` column of `-` (or the group missing members entirely, while `LAG` on every
+partition only grows) means the group has no active consumer even though `docker compose ps` and
+the readiness probe both say `healthy`. Compare against
+[Symptom: a consumer group is stuck](#symptom-a-consumer-group-is-stuck-lag-grows-and-never-drains)
+— that one still shows a `CONSUMER-ID`, just not making progress; this one shows none at all.
+
+### Recovery
+
+```bash
+docker compose restart enrichment-service
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group fraud-enrichment-group
+```
+
+Confirm every partition has a `CONSUMER-ID` again and `LAG` starts draining before considering it
+resolved.
+
+### The detection gap
+
+Nothing in this repo currently pages on this by itself — the outbox-depth gauge and the
+default-decision rate (top of this document) will eventually show the effect, but only after
+enough transactions have piled up behind the stalled group. Until issue #24 lands a real fix or a
+targeted consumer-liveness check, treat a climbing `TIMEOUT_DEFAULT` rate with **no** corresponding
+Redis, Kafka, or Couchbase outage as a reason to run the `--describe --group` check above, not just
+the Pub/Sub check.
+
+---
+
 ## Symptom: a deploy or restart causes a latency spike
 
 **Expected, and bounded.** Cooperative sticky rebalancing means only the partitions actually
