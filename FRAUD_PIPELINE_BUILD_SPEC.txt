@@ -1,0 +1,754 @@
+================================================================================
+REAL-TIME FRAUD DETECTION PIPELINE — BUILD & TEST SPECIFICATION
+================================================================================
+Target audience for this document: an AI coding agent (Claude Code / Claude
+Opus operating agentically) that will implement, run, and test this system.
+
+Target audience for the resulting system: a human engineer who will run it
+locally via Docker Compose, exercise it end-to-end, and read the code.
+
+This is a pure engineering specification. It contains no company names, no
+employment narrative, no interview-preparation material. It should be treated
+exactly as you would treat a real production design document, because the
+goal is a real, runnable, correctly-tested system — not a demo that merely
+looks the part.
+
+--------------------------------------------------------------------------------
+HOW TO USE THIS DOCUMENT (INSTRUCTIONS TO THE CODING AGENT)
+--------------------------------------------------------------------------------
+1. Read this entire document before writing any code. Sections reference each
+   other; implementing Section 6 correctly depends on the guarantees defined
+   in Section 8.
+
+2. Build in the phase order given in Section 12 ("Build Order"). Each phase
+   has explicit exit criteria — do not proceed to the next phase until the
+   current phase's tests pass against REAL dependencies (real Kafka, real
+   Redis, real Couchbase, via Testcontainers or docker-compose — never mocks
+   of the infrastructure itself for integration tests; mocks are acceptable
+   only in pure unit tests of business logic).
+
+3. Section 9 ("Non-Negotiable Correctness Requirements") is not a nice-to-have
+   list. Each item exists because its naive alternative has a specific,
+   named failure mode, which is documented alongside it. Do not simplify
+   these away for convenience. If a requirement seems to conflict with
+   another, stop and flag it in your response rather than silently picking
+   one.
+
+4. Section 10 ("Required Test Scenarios") gives concrete, named scenarios
+   with explicit expected outcomes. Treat these as acceptance criteria.
+   Implement each as an automated integration test — not as something the
+   human has to manually verify via Postman, though a manual smoke-test
+   script should also exist per Section 11.
+
+5. After each phase, produce a short written summary of: what was built,
+   which tests pass, and any deviation from this spec (with reasoning).
+
+6. Where this document gives a JSON schema or a class name, treat it as
+   exact — other engineers (and other AI agents, in later sessions) will
+   depend on the shapes being stable. Where it gives a numeric parameter
+   (partition count, TTL, timeout), treat it as a deliberate design decision
+   with a stated reason, not a placeholder to be casually changed.
+
+7. Do not add Kubernetes manifests, Helm charts, or cloud-provider-specific
+   code as part of the core build. Section 13 ("Explicitly Out Of Scope")
+   covers this and gives a stretch-goal appendix for later.
+
+================================================================================
+SECTION 1 — PROBLEM STATEMENT
+================================================================================
+Build a real-time fraud detection system for financial transactions. Given a
+transaction (a payment, transfer, or similar financial event), the system
+must return one of three decisions — ALLOW, REVIEW, or BLOCK — before the
+transaction is allowed to complete, based on behavioral signals computed in
+real time plus a configurable, hot-reloadable rule engine.
+
+Core constraints that drive every architectural decision below:
+- The decision must be returned to the caller within a bounded time budget
+  (target: sub-100ms at p99 in a properly warmed local environment; a hard
+  150ms timeout with a safe default, described in Section 6).
+- Every decision must be fully explainable after the fact: which signals
+  fired, their values, the thresholds in effect at decision time, and the
+  policy version. No black-box scoring.
+- Fraud rules must be updatable by a non-engineer (a "fraud ops" persona)
+  without a code deployment.
+- No transaction may be silently lost between being received and being
+  scored, even under process crashes, network partitions, or duplicate
+  client retries.
+- The audit trail is append-only. Nothing is ever deleted or overwritten.
+
+================================================================================
+SECTION 2 — SCOPE: WHAT IS ACTUALLY BUILT, LOCALLY, FOR REAL
+================================================================================
+Everything in this document is built to run on a single developer machine via
+Docker Compose. Every infrastructure dependency is REAL — real Kafka, real
+Redis, real Couchbase — not simulated. There is no cloud dependency anywhere
+in the core build. See Section 13 for what is explicitly deferred.
+
+The system is 8 independently deployable services:
+  1. mock-payment-api      (a stand-in for a pre-existing upstream caller)
+  2. gateway-service
+  3. ingestion-service
+  4. enrichment-service
+  5. scoring-service
+  6. decision-service
+  7. action-audit-service
+  8. (infra init jobs — not a service, but a one-shot container that creates
+     Kafka topics and Couchbase buckets/scopes/collections/indexes/seed data
+     on `docker-compose up`)
+
+Why mock-payment-api exists: the fraud pipeline is meant to be dropped into
+an existing system, not to be the front door itself. Without a real caller
+in front of it, the most important boundary in the whole design — "who calls
+whom, and where does the synchronous/asynchronous seam sit" — can only be
+described, never demonstrated. mock-payment-api is a small, real Spring Boot
+service simulating that pre-existing caller: it accepts a payment request,
+makes exactly the kind of internal call a real payment service would make
+into the fraud pipeline's Gateway, and returns a real HTTP response reflecting
+the fraud decision it got back.
+
+================================================================================
+SECTION 3 — TECHNOLOGY STACK (PINNED, WITH REASONS)
+================================================================================
+- Language/runtime: Java 21, Spring Boot 3.3.x
+  Reason: Java 21 LTS gives access to records, sealed interfaces, and
+  pattern-matching switch, which are used throughout for concise, safe DTOs
+  and rule-evaluation logic.
+
+- Build tool: Maven, one independent multi-module-free project PER service
+  (each service has its own pom.xml and is independently buildable/
+  deployable — no shared compiled library between services). Shared
+  contracts (Kafka message shapes) are specified as JSON Schemas in Section
+  7 and Section 8; each service implements its own matching DTOs. This is a
+  deliberate choice: sharing a compiled DTO jar across service boundaries
+  creates a distributed-monolith coupling risk that isn't worth the minor
+  convenience it buys at this scale.
+
+- Messaging: Apache Kafka 4.x in KRaft mode. Zookeeper is not used and is
+  not an available option in Kafka 4.x — KRaft is the only supported mode.
+  Use the official apache/kafka Docker image (or confluentinc/cp-kafka
+  pinned to a 7.x tag that ships Kafka 4.x) configured as a single
+  combined broker+controller node for local development (process.roles=
+  broker,controller). Do not attempt a 3-broker local cluster; it adds
+  operational complexity with no benefit for local development and testing.
+
+- Cache / real-time signal store: Redis 7.x, official redis image.
+
+- Persistent store: Couchbase Server 7.x Community Edition, official
+  couchbase/server Docker image. N1QL, GSI indexes, multi-document ACID
+  transactions, and the Java SDK's Binary Collection counter API are all
+  available in Community Edition and are all used.
+
+- Testing: JUnit 5, Mockito for pure unit tests of business logic.
+  Testcontainers (org.testcontainers: kafka, couchbase are both real,
+  maintained modules) for integration tests that stand up REAL Kafka, REAL
+  Couchbase, and a REAL Redis container per test class. Do not write
+  integration tests against in-memory fakes of these systems — the entire
+  point of Section 9's requirements is to prove behavior against real
+  infrastructure semantics (real Kafka rebalancing, real Couchbase
+  transaction semantics, real Redis Lua atomicity).
+
+- Observability (lightweight, no external services required): Spring Boot
+  Actuator + Micrometer, exposing /actuator/prometheus on every service.
+  This is nearly free with Spring Boot and directly supports later
+  questions like "how would you measure p99" with a real, running answer —
+  a Prometheus/Grafana docker-compose add-on is a stretch goal (Section 13)
+  but Micrometer instrumentation itself is REQUIRED in the core build.
+
+- Containerization: Docker + Docker Compose (compose v2 syntax). Every
+  service gets its own multi-stage Dockerfile (Maven build stage + slim JRE
+  runtime stage).
+
+================================================================================
+SECTION 4 — REPOSITORY LAYOUT
+================================================================================
+fraud-detection-pipeline/
+├── docker-compose.yml
+├── README.md                        (how to run, how to test, how to demo)
+├── mock-payment-api/
+│   ├── pom.xml
+│   ├── Dockerfile
+│   └── src/...
+├── gateway-service/
+├── ingestion-service/
+├── enrichment-service/
+├── scoring-service/
+├── decision-service/
+├── action-audit-service/
+│   (each of the above 6 follows the same shape as mock-payment-api)
+├── infra/
+│   ├── couchbase-init/
+│   │   ├── init.sh                  (bucket/scope/collection creation,
+│   │   │                              N1QL index creation, seed data insert)
+│   │   └── seed-fraud-rules.json    (the 8 default rules, see Section 8)
+│   └── kafka-init/
+│       └── create-topics.sh         (creates all topics from Section 7's
+│                                      table with exact partition counts)
+├── scripts/
+│   ├── smoke-test.sh                (curl-based, exercises every scenario
+│   │                                  in Section 10 against a running
+│   │                                  docker-compose stack)
+│   └── load-test.js                 (a small k6 script — optional stretch,
+│   │                                  see Section 13)
+└── future-work/                     (see Section 13 — NOT required for the
+                                       core build to be considered done)
+    ├── DESIGN_ONLY_aws-topology.md
+    └── helm-skeletons/
+
+================================================================================
+SECTION 5 — HIGH-LEVEL ARCHITECTURE
+================================================================================
+mock-payment-api
+      | HTTP POST /payments/initiate  (this is the ONE deliberately
+      |                                 synchronous external entry point)
+      v
+gateway-service
+      | JWT check (a shared-secret HMAC check is sufficient for this build;
+      |  no external identity provider is required), Redis-backed rate
+      |  limiting, correlation ID generation, then a fast synchronous HTTP
+      |  call to ingestion-service
+      v
+ingestion-service
+      | idempotency check (Redis) -> Couchbase multi-doc transaction
+      |  (transaction record + outbox record) -> returns 202 to gateway
+      |  immediately; a background thread publishes the outbox record to
+      |  Kafka asynchronously
+      v
+   [Kafka: fraud.transactions.raw]
+      v
+enrichment-service (Kafka consumer)
+      | Redis-backed signal computation (velocity, geo, device)
+      v
+   [Kafka: fraud.transactions.enriched]
+      v
+scoring-service (Kafka consumer)
+      | loads rules from Couchbase (cached, hot-reloadable), evaluates all
+      |  enabled rules, computes a weighted score
+      v
+   [Kafka: fraud.transactions.scored]
+      v
+decision-service (Kafka consumer)
+      | applies policy thresholds to the score -> ALLOW / REVIEW / BLOCK,
+      |  writes the decision to Couchbase, PUBLISHES to a Redis Pub/Sub
+      |  channel keyed by correlationId (this is what wakes up the
+      |  gateway's waiting request — see Section 6)
+      v
+   [Kafka: fraud.transactions.decisioned]
+      v
+action-audit-service (Kafka consumer)
+      | writes to the immutable Couchbase audit ledger; for REVIEW/BLOCK,
+      |  calls a webhook back on mock-payment-api
+      |
+      +--> back to gateway-service, which is meanwhile waiting on the
+           Redis Pub/Sub channel for this correlationId (bounded by a
+           150ms timeout) -> returns the decision synchronously to
+           mock-payment-api's original HTTP call
+
+Meanwhile: gateway-service's HTTP handler, after the fast synchronous call
+to ingestion-service returns 202, does NOT return to mock-payment-api yet.
+It opens a non-blocking, reactive subscription to a Redis Pub/Sub channel
+named `decision:{correlationId}`. decision-service publishes to this exact
+channel the moment it finishes. If gateway-service's subscription receives
+a message within 150ms, it returns that decision to mock-payment-api
+immediately. If the 150ms timeout elapses first, gateway-service returns a
+default REVIEW decision to mock-payment-api — but the real pipeline keeps
+running regardless, and the eventual real decision is still written to
+Couchase and (if it disagrees with the REVIEW default) triggers a webhook
+callback to mock-payment-api's /webhooks/fraud-decision endpoint for
+reconciliation.
+
+This is the single most important behavior in the whole system. It must be
+implemented exactly as described, and it must be covered by an integration
+test that artificially delays the pipeline (e.g. via a Testcontainers
+toxiproxy or a simple injected sleep in a test profile) to force the
+timeout path and assert the REVIEW-then-webhook-reconciliation behavior.
+
+================================================================================
+SECTION 6 — WHY THE SYNC-FACADE PATTERN, SPECIFICALLY
+================================================================================
+An external caller (mock-payment-api, standing in for a real upstream
+system) needs a same-request-cycle answer: it cannot let a payment complete
+without knowing ALLOW/REVIEW/BLOCK. But the internal pipeline benefits from
+being fully asynchronous (Kafka-decoupled) between its own stages — failure
+isolation, independent scaling per stage, replay capability, and no
+cascading failure if one stage is briefly slow.
+
+The resolution: exactly ONE synchronous leg (mock-payment-api -> gateway ->
+ingestion, all fast, sub-10ms of actual work), and then a bounded,
+non-blocking WAIT (not a poll loop — a genuine event-driven subscription)
+for the asynchronous backbone to produce a result, capped by a hard timeout
+with a safe, explicitly-chosen default (REVIEW, not ALLOW — an unresolved
+decision should never silently permit a transaction).
+
+Implementation requirement: gateway-service MUST be built with Spring
+WebFlux (reactive), and the wait MUST be implemented as a Mono subscribing
+to Redis Pub/Sub (Lettuce's reactive Redis client supports this natively),
+with `.timeout(Duration.ofMillis(150))` and `.onErrorReturn(...)` providing
+the fallback. Do NOT implement this as a blocking Thread.sleep-based poll
+loop against Couchbase or Redis — that was considered and rejected (see the
+latency math below) precisely because polling adds an average of half the
+poll interval as pure waste, and ties up a thread per in-flight request
+under a traditional blocking servlet model.
+
+Latency math that justifies this specific design: a naive 20ms-interval
+poll adds an average of 10ms and a worst case of 20ms of pure waiting on
+top of whatever the real processing time is, for every single request. At
+the target scale this is a meaningful fraction of a 100ms budget. A
+push-based Pub/Sub wait adds sub-millisecond wakeup latency instead.
+
+================================================================================
+SECTION 7 — KAFKA TOPIC DESIGN
+================================================================================
+| Topic                              | Partitions | Key         | Retention |
+|-------------------------------------|-----------|-------------|-----------|
+| fraud.transactions.raw              | 6         | customerId  | 7 days    |
+| fraud.transactions.enriched         | 6         | customerId  | 7 days    |
+| fraud.transactions.scored           | 6         | customerId  | 7 days    |
+| fraud.transactions.decisioned       | 6         | customerId  | 30 days   |
+| fraud.transactions.actioned         | 6         | customerId  | 30 days   |
+| fraud.alerts.realtime               | 3         | merchantId  | 1 day     |
+| fraud.transactions.raw.dlq          | 3         | customerId  | 30 days   |
+| fraud.transactions.enriched.dlq     | 3         | customerId  | 30 days   |
+| fraud.transactions.scored.dlq       | 3         | customerId  | 30 days   |
+
+customerId as the partition key is load-bearing, not incidental: velocity
+detection requires that all of one customer's transactions are processed in
+order by a single consumer instance. If a customer's events were split
+across partitions, two consumer instances could race on that customer's
+velocity counter.
+
+Kafka broker config for local KRaft single-node: since there is only one
+broker locally, replication.factor must be 1 for local development (a
+3-broker RF=3/min.insync.replicas=2/acks=all setup, as would be used in a
+real multi-broker deployment, is documented in future-work/ but is not
+meaningful to actually configure against a single local broker — do not
+create a fake 3-broker Docker Compose setup purely for show; a single KRaft
+node correctly reflects what is actually being tested locally).
+
+Consumer configuration requirement: every consumer group in this system
+MUST set `partition.assignment.strategy` to
+`org.apache.kafka.clients.consumer.CooperativeStickyAssignor` explicitly —
+not the default RangeAssignor. Reason: with the default eager assignor, a
+consumer group rebalance (triggered by a pod restart, a deployment, or a
+consumer joining/leaving) pauses ALL partitions in the group for the
+duration of the rebalance, including partitions that aren't actually being
+reassigned. CooperativeStickyAssignor only pauses the specific partitions
+being transferred. Write an integration test that starts a consumer group
+with 2 instances, kills one, and asserts that message processing on the
+UNAFFECTED partitions continues without a gap — this is the direct,
+demonstrable proof of why this setting matters.
+
+Offset commit strategy: manual, never auto-commit. Every consumer commits
+its offset only after its own unit of work is durably complete (a
+Couchbase write, or a Kafka publish to the next topic, or both) — never
+before. This is what makes redelivery-after-crash safe rather than
+loss-causing.
+
+================================================================================
+SECTION 8 — COUCHBASE DATA MODEL
+================================================================================
+Bucket: fraud-detection
+  Scope: transactions
+    Collection: raw-transactions
+    Collection: outbox
+  Scope: intelligence
+    Collection: fraud-rules
+    Collection: customer-profiles
+  Scope: audit
+    Collection: decisions
+    Collection: audit-ledger
+    Collection: cases
+
+--- raw-transactions document ---
+Key pattern: txn::{transactionId}
+{
+  "docType": "TRANSACTION",
+  "transactionId": "string, required, client-supplied idempotency key",
+  "customerId": "string, required",
+  "merchantId": "string, required",
+  "merchantCategoryCode": "string, 4-digit MCC",
+  "amount": "number, required, > 0",
+  "currency": "string, ISO 4217, e.g. INR",
+  "countryCode": "string, ISO 3166-1 alpha-2",
+  "deviceId": "string, required",
+  "ipAddress": "string",
+  "paymentMethod": "enum: CARD | BANK_TRANSFER | WALLET",
+  "status": "enum: PENDING | PROCESSED",
+  "correlationId": "string, required",
+  "createdAt": "ISO-8601 timestamp"
+}
+
+--- outbox document ---
+Key pattern: outbox::{outboxId}  (outboxId is a fresh UUID, distinct from
+transactionId)
+{
+  "docType": "OUTBOX_EVENT",
+  "status": "enum: PENDING | PUBLISHED",
+  "targetTopic": "fraud.transactions.raw",
+  "payload": { ...the raw-transactions document content... },
+  "createdAt": "ISO-8601 timestamp",
+  "publishedAt": "ISO-8601 timestamp, null until published"
+}
+
+--- fraud-rules document (hot-reloadable) ---
+Key pattern: rule::{ruleId}
+{
+  "docType": "FRAUD_RULE",
+  "ruleId": "string, e.g. VELOCITY_1M",
+  "description": "human-readable",
+  "signalKey": "string, matches a key in the enriched-signal map",
+  "operator": "enum: GREATER_THAN | LESS_THAN | EQUALS | BOOLEAN_TRUE",
+  "threshold": "number",
+  "weight": "integer, 0-100",
+  "enabled": "boolean",
+  "category": "enum: VELOCITY | GEO | DEVICE | AMOUNT | MERCHANT | TIME",
+  "version": "integer, incremented on every edit"
+}
+
+Seed data — insert exactly these 8 rules on init (infra/couchbase-init/
+seed-fraud-rules.json):
+| ruleId                  | signalKey              | operator      | threshold | weight |
+|-------------------------|-------------------------|---------------|-----------|--------|
+| VELOCITY_1M             | velocity_1m             | GREATER_THAN  | 5         | 30     |
+| VELOCITY_1H             | velocity_1h             | GREATER_THAN  | 20        | 20     |
+| GEO_ANOMALY             | distinct_countries_24h  | GREATER_THAN  | 1         | 25     |
+| DEVICE_SHARED           | customers_per_device    | GREATER_THAN  | 3         | 20     |
+| NEW_DEVICE_HIGH_AMOUNT  | is_new_device_high_amt  | BOOLEAN_TRUE  | n/a       | 25     |
+| OFF_HOURS_LARGE_TXN     | is_off_hours_large      | BOOLEAN_TRUE  | n/a       | 15     |
+| HIGH_RISK_MCC           | merchant_risk_score     | GREATER_THAN  | 80        | 20     |
+| AMOUNT_DEVIATION        | amount_vs_p90_ratio     | GREATER_THAN  | 3.0       | 20     |
+
+--- decisions document (immutable once written) ---
+Key pattern: decision::{transactionId}
+{
+  "docType": "FRAUD_DECISION",
+  "transactionId": "string",
+  "customerId": "string",
+  "riskScore": "integer, 0-100",
+  "decision": "enum: ALLOW | REVIEW | BLOCK",
+  "triggeredRules": [
+    { "ruleId": "string", "contribution": "integer",
+      "actualValue": "number|boolean", "threshold": "number|null" }
+  ],
+  "decisionAt": "ISO-8601 timestamp, millisecond precision",
+  "policyVersion": "string",
+  "correlationId": "string"
+}
+
+--- audit-ledger document (append-only, enforced at the application layer
+AND, if using Couchbase Enterprise, at the RBAC layer with an insert-only
+role — Community Edition should enforce this purely at the application
+layer: the repository class for this collection MUST expose only an
+insert()-style method and MUST NOT expose update or delete methods at all,
+so it is a compile-time impossibility to modify a ledger entry from this
+codebase) ---
+Key pattern: audit::{transactionId}::{eventType}
+Same core fields as the decision document, plus:
+{
+  "eventType": "enum: DECISION_RECORDED | ACTION_EXECUTED | CASE_CREATED",
+  "serviceVersion": "string"
+}
+
+N1QL indexes to create on init (infra/couchbase-init/init.sh):
+CREATE INDEX idx_rules_enabled
+  ON `fraud-detection`.`intelligence`.`fraud-rules` (enabled, category);
+
+CREATE INDEX idx_decisions_customer
+  ON `fraud-detection`.`audit`.`decisions` (customerId, decisionAt DESC);
+
+CREATE INDEX idx_outbox_pending
+  ON `fraud-detection`.`transactions`.`outbox` (status)
+  WHERE status = "PENDING";
+
+Verify with EXPLAIN that queries against these use IndexScan, not
+PrimaryScan, as part of the integration test suite for scoring-service and
+ingestion-service.
+
+================================================================================
+SECTION 9 — NON-NEGOTIABLE CORRECTNESS REQUIREMENTS
+================================================================================
+Each requirement below states: the requirement, the naive alternative, and
+the specific failure mode that alternative produces. Implement the stated
+requirement, not the naive alternative, even though the naive alternative
+is simpler.
+
+9.1 IDEMPOTENT INGESTION
+Requirement: ingestion-service checks a Redis key `idempotency:{transactionId}`
+before processing; on a cache hit, returns the previously-cached response
+without reprocessing. Separately, and as the FINAL authoritative guard even
+if Redis is unavailable or missed, the Couchbase write uses insert() (which
+throws DocumentExistsException on a duplicate key), never upsert().
+Naive alternative: using upsert() for the transaction write.
+Failure mode: a duplicate request (client retry after an ambiguous
+network timeout) silently overwrites the original record and, worse,
+publishes a second Kafka event for what should be one transaction.
+
+9.2 THE OUTBOX PATTERN
+Requirement: the transaction record and its corresponding outbox record are
+written in a single Couchbase multi-document ACID transaction (use the
+Couchbase Java SDK's `cluster.transactions().run(...)` API directly, not
+Spring Data, which does not expose multi-document transactions). A separate
+background thread/scheduled task polls for PENDING outbox records and
+publishes them to Kafka, marking PUBLISHED only after a Kafka producer ack.
+Naive alternative: write to Couchbase, then publish to Kafka as two
+separate, unrelated operations.
+Failure mode: if the process crashes between the two operations, the
+transaction is durably recorded but the fraud pipeline never sees it —
+the transaction is silently never scored.
+
+9.3 ATOMIC VELOCITY COUNTERS
+Requirement: every Redis counter mutation for velocity, and any other
+check-then-act sequence against Redis, is implemented as a single Lua
+script executed via EVAL, guaranteeing server-side atomicity. Example for
+the 1-minute velocity counter:
+  local current = redis.call('INCR', KEYS[1])
+  if current == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+  end
+  return current
+Naive alternative: separate INCR then EXPIRE calls from the application.
+Failure mode: a race condition between the existence-check and the
+EXPIRE call under concurrent requests for the same customer can leave a
+counter that never expires, or can have its TTL window reset incorrectly
+by a second concurrent request.
+
+9.4 SCORING AND DECISION ARE SEPARATE SERVICES (not separate classes in
+one service — genuinely separate deployable services, separate Kafka
+consumer groups, separate topics between them)
+Requirement: scoring-service computes an objective, weighted score from
+enabled rules and publishes it. decision-service independently loads
+POLICY (threshold-to-decision mapping) from its own Couchbase document and
+applies it to the score it consumes.
+Naive alternative: a single service that both scores and decides.
+Failure mode: changing a business policy threshold (e.g., raising the
+BLOCK cutoff during a promotional period) requires redeploying the same
+artifact that contains the scoring logic, coupling a business/policy change
+to an engineering release cycle, and making it impossible for an auditor to
+distinguish "the model changed" from "the policy changed" when reviewing a
+historical decision.
+
+9.5 COOPERATIVE STICKY REBALANCING
+Requirement: as stated in Section 7 — explicit
+partition.assignment.strategy=CooperativeStickyAssignor on every consumer.
+Naive alternative: the Kafka client default (RangeAssignor / eager
+rebalancing).
+Failure mode: during any rebalance (a rolling restart, a pod
+crash, a consumer scaling event), ALL partitions in the group pause, not
+just the ones being reassigned — and in the interval before the old
+consumer's offset commit is visible to the new consumer, both may briefly
+process overlapping messages, double-counting stateful signals like
+velocity.
+
+9.6 MANUAL, POST-WORK OFFSET COMMITS
+Requirement: as stated in Section 7 — commit only after the unit of work
+(Couchbase write and/or downstream Kafka publish) is confirmed durable.
+Naive alternative: Spring Kafka's default auto-commit.
+Failure mode: auto-commit can mark a message as processed before the
+actual processing (a Couchbase write, say) has completed, so a crash in
+that window causes silent message loss rather than safe redelivery.
+
+9.7 APPEND-ONLY AUDIT LEDGER
+Requirement: as stated in Section 8 — the repository for the audit-ledger
+collection exposes no update or delete methods, at the Java interface
+level, not merely "by convention."
+Naive alternative: a generic CRUD repository reused for this collection.
+Failure mode: nothing in the code prevents a future change (by a human
+or an AI agent working on a later feature) from silently editing a
+historical audit record, which would be a serious regulatory and
+trust problem in a real system.
+
+9.8 THE SYNC-FACADE TIMEOUT MUST HAVE A NAMED, DELIBERATE DEFAULT
+Requirement: as stated in Section 6 — on timeout, return REVIEW, never
+ALLOW.
+Naive alternative: returning ALLOW on timeout, reasoning that "the
+pipeline probably would have allowed it anyway."
+Failure mode: an unresolved decision defaulting to ALLOW means any
+pipeline slowdown (a GC pause, a Kafka rebalance, a Redis blip) silently
+converts into "let every ambiguous transaction through" — exactly
+backwards from the system's purpose.
+
+================================================================================
+SECTION 10 — REQUIRED TEST SCENARIOS (ACCEPTANCE CRITERIA)
+================================================================================
+Implement each of the following as an automated integration test (using
+Testcontainers for real Kafka + real Couchbase + real Redis, or against the
+docker-compose stack for the end-to-end smoke tests). State the expected
+outcome precisely; do not weaken an assertion to make a test pass.
+
+T1 — Clean allow path
+  A transaction with no unusual signals (new customer, single transaction,
+  normal amount, known device) should resolve to ALLOW with riskScore below
+  30, within the 150ms timeout window (i.e., resolved via the real pipeline,
+  not the timeout fallback).
+
+T2 — Velocity-triggered block
+  Submit 6 transactions for the same customerId within a few seconds
+  (exceeding the VELOCITY_1M threshold of 5). Assert the 6th transaction's
+  decision includes VELOCITY_1M in triggeredRules and results in a riskScore
+  and decision consistent with the rule's weight (BLOCK if this alone or in
+  combination crosses the policy threshold — assert against the actual
+  computed score, not a hardcoded expectation).
+
+T3 — Duplicate request idempotency
+  Submit the exact same transactionId twice, concurrently (use two threads
+  or two near-simultaneous HTTP calls). Assert: exactly one transaction
+  record exists in Couchbase, exactly one Kafka event was published to
+  fraud.transactions.raw for that transactionId, and both HTTP callers
+  receive the same decision.
+
+T4 — Outbox durability under simulated crash
+  Using a test hook (a feature flag or profile that stops the
+  OutboxPublisher background thread immediately after the Couchbase
+  transaction commits, before the Kafka publish), assert that the outbox
+  record remains PENDING, and that restarting the publisher picks it up
+  and successfully publishes it — i.e., no transaction is ever silently
+  dropped, only delayed.
+
+T5 — Cooperative sticky rebalance does not interrupt unaffected partitions
+  Start an enrichment-service consumer group with 2 instances against a
+  topic with at least 4 partitions. Confirm steady-state consumption on all
+  partitions. Kill one instance. Assert that partitions NOT reassigned
+  continue processing without a gap, and that the reassigned partitions
+  resume within a bounded time — and assert this test would FAIL if
+  RangeAssignor were configured instead (i.e., write the test so it is
+  actually meaningful, not just checking eventual consistency).
+
+T6 — Redis outage degrades, does not fail closed or fail wide open
+  With Redis stopped (or its container paused via Testcontainers), submit
+  a transaction. Assert: the request does not hang or error out; velocity/
+  geo/device signals default to absent/zero; the resulting risk score is
+  computed from only the signals that ARE available (Couchbase-backed
+  ones); and the decision leans toward ALLOW rather than BLOCK for an
+  otherwise-clean transaction, per the fail-open reasoning in Section 9.
+
+T7 — Sync-facade timeout path with later reconciliation
+  Using a test hook that artificially delays scoring-service or
+  decision-service beyond 150ms, submit a transaction through
+  mock-payment-api. Assert: the HTTP caller receives REVIEW within
+  approximately 150ms (not hanging until the real pipeline finishes).
+  Separately, assert that once the real pipeline DOES finish (asynchronously,
+  after the HTTP response was already sent), the true decision is written to
+  Couchbase, and if it differs from REVIEW, a webhook call is made to
+  mock-payment-api's /webhooks/fraud-decision endpoint.
+
+T8 — Hot-reload of a fraud rule with no restart
+  Update a rule's `enabled` field or `weight` directly in Couchbase (as a
+  fraud-ops actor would). Without restarting scoring-service, assert that
+  within the documented refresh interval (60 seconds, or immediately via
+  the admin force-refresh endpoint — implement both), a new transaction's
+  scoring reflects the updated rule.
+
+T9 — Append-only ledger cannot be mutated
+  This is a compile-time / code-review-level test: assert (e.g., via a
+  simple reflection-based unit test) that the audit-ledger repository
+  interface has no methods matching update/delete/upsert signatures.
+
+T10 — Full end-to-end smoke test via docker-compose (scripts/smoke-test.sh)
+  Bring up the full stack with `docker-compose up`, wait for health checks,
+  then run T1 and T2's scenarios via curl against mock-payment-api's real
+  HTTP port, printing a clear pass/fail summary. This is the script a human
+  runs to demo the system live.
+
+================================================================================
+SECTION 11 — OBSERVABILITY REQUIREMENTS (LIGHTWEIGHT, REQUIRED)
+================================================================================
+- Every service exposes /actuator/health and /actuator/prometheus.
+- Every log line includes the correlationId via MDC, in a structured
+  (JSON) format, so `docker-compose logs | grep <correlationId>` can
+  reconstruct a single transaction's full journey across all 7 services.
+- decision-service and scoring-service specifically must log the full
+  triggeredRules breakdown at INFO level for every non-ALLOW decision —
+  this is what makes the system's explainability property demonstrable in
+  the logs, not just in the stored document.
+- A minimal Micrometer Timer around the full mock-payment-api ->
+  decision-received latency, so p50/p99 can genuinely be queried from
+  /actuator/prometheus after running a batch of test transactions — this
+  is not decorative; it should produce real numbers on a real machine.
+
+================================================================================
+SECTION 12 — BUILD ORDER (PHASES, WITH EXIT CRITERIA)
+================================================================================
+Phase 1 — Infra skeleton
+  docker-compose.yml with Kafka (KRaft), Redis, Couchbase services only.
+  infra/kafka-init and infra/couchbase-init scripts, run as one-shot
+  containers. Exit criteria: `docker-compose up` brings up all three,
+  topics exist (verify via kafka-topics.sh --list), Couchbase bucket/
+  scopes/collections/indexes exist and the 8 seed rules are queryable via
+  N1QL.
+
+Phase 2 — Ingestion path (mock-payment-api, gateway-service skeleton
+  without the sync-facade wait yet, ingestion-service, outbox)
+  Exit criteria: T3 and T4 pass. A transaction posted via mock-payment-api
+  results in a real Couchbase record and a real Kafka message on
+  fraud.transactions.raw, observable via kafka-console-consumer.
+
+Phase 3 — Enrichment + Scoring
+  Exit criteria: T2 and T8 pass. Redis signals are computed correctly and
+  atomically (write a focused concurrency test for the Lua script
+  specifically, hammering it with concurrent increments and asserting the
+  final count is exactly correct).
+
+Phase 4 — Decision + the sync facade
+  Exit criteria: T1, T6, T7 pass. This is the phase where gateway-service
+  gains its real Redis Pub/Sub wait, replacing any placeholder synchronous
+  behavior from Phase 2.
+
+Phase 5 — Action & Audit, webhook reconciliation
+  Exit criteria: T7's reconciliation half and T9 pass. Full T10 end-to-end
+  smoke test passes.
+
+Phase 6 — Rebalancing behavior
+  Exit criteria: T5 passes. This is deliberately last because it requires
+  the full consumer-group machinery from earlier phases to already be
+  correct.
+
+Do not consider the build "done" until all of T1-T10 pass against the real
+docker-compose stack, not just against Testcontainers-isolated unit-level
+integration tests.
+
+================================================================================
+SECTION 13 — EXPLICITLY OUT OF SCOPE FOR THE CORE BUILD
+================================================================================
+The following are real, valid parts of a production deployment of this
+system, but are NOT required for this build to be considered complete, and
+should not be implemented unless separately requested:
+
+- Kubernetes manifests or Helm charts for a real cluster (a design-only
+  markdown document describing the target EKS/Helm/MSK/ElastiCache/Capella
+  topology may be written to future-work/DESIGN_ONLY_aws-topology.md, and
+  bare-bones Helm chart skeletons — templates only, never applied to a real
+  cluster — may be written to future-work/helm-skeletons/ as a stretch
+  goal, clearly marked as unexercised).
+- Any actual AWS resource or Terraform.
+- A multi-broker Kafka cluster, or any replication-factor > 1 configuration
+  (not meaningful against a single local broker).
+- A real identity provider / OAuth flow for JWT issuance (a shared-secret
+  HMAC check is sufficient — document this simplification in the README).
+- Prometheus + Grafana as running containers (Micrometer instrumentation on
+  each service, per Section 11, IS required; wiring it into a dashboard is
+  a stretch goal, not core scope).
+- A k6 or similar load-testing script beyond a basic smoke test (Section
+  10's T10 is required; anything more elaborate is a stretch goal in
+  scripts/load-test.js).
+- Machine learning / any scoring beyond the deterministic weighted-rule
+  engine described in Section 8. The rule engine is the complete scope of
+  "scoring" for this build.
+
+================================================================================
+SECTION 14 — DEFINITION OF DONE
+================================================================================
+- `docker-compose up` brings up all 7 services plus infra with no manual
+  steps beyond that single command (init scripts run automatically as
+  one-shot containers with proper depends_on/healthcheck ordering).
+- scripts/smoke-test.sh, run against the resulting stack, passes and
+  prints a clear scenario-by-scenario summary.
+- All of T1-T10 from Section 10 exist as automated tests and pass.
+- README.md documents: how to run, how to test, how to manually exercise
+  a specific scenario via curl, and a short "what would break and how you'd
+  notice" section covering at minimum a Redis outage and a Kafka consumer
+  rebalance.
+- Every non-negotiable requirement in Section 9 is implemented as
+  described, not approximated.
+
+================================================================================
+END OF SPECIFICATION
+================================================================================

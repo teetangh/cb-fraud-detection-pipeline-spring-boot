@@ -1,0 +1,44 @@
+# Maven
+target/
+!.mvn/wrapper/maven-wrapper.properties
+.mvn/wrapper/*.jar
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+nbproject/
+.factorypath
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / runtime
+*.log
+logs/
+*.pid
+*.hprof
+hs_err_pid*
+
+# Local env + secrets — never commit real credentials
+.env
+.env.local
+*.local.yml
+
+# Couchbase / Kafka container data if ever bind-mounted
+data/
+volumes/
+
+# Test output
+**/surefire-reports/
+**/failsafe-reports/
+.attach_pid*
