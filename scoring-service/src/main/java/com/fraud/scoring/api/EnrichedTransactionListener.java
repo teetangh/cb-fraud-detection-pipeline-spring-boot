@@ -63,19 +63,47 @@ public class EnrichedTransactionListener {
     @KafkaListener(topics = "${fraud.topics.enriched:fraud.transactions.enriched}",
                    groupId = "${spring.kafka.consumer.group-id:fraud-scoring-group}")
     public void onEnrichedTransaction(String payload, Acknowledgment acknowledgment) throws Exception {
-        ObjectNode enriched = (ObjectNode) objectMapper.readTree(payload);
+        // A payload that fails to parse, or parses to something other than a
+        // JSON object (an array, a scalar, an empty body), used to throw here
+        // uncaught. That skipped acknowledgment.acknowledge() below, so with
+        // manual commits (§9.6) the offset was never advanced — the same
+        // record redelivers forever and processing on the WHOLE partition
+        // stops, not just this one record. One malformed message must cost
+        // one message, not the partition.
+        JsonNode parsed;
+        try {
+            parsed = objectMapper.readTree(payload);
+        } catch (Exception e) {
+            log.error("Unparseable payload on fraud.transactions.enriched — acknowledging so one "
+                      + "bad message does not block the partition. length={}",
+                      payload == null ? 0 : payload.length(), e);
+            acknowledgment.acknowledge();
+            return;
+        }
+        if (!(parsed instanceof ObjectNode enriched)) {
+            log.error("Payload on fraud.transactions.enriched is not a JSON object ({}) — "
+                      + "acknowledging so one bad message does not block the partition.",
+                      parsed.getClass().getSimpleName());
+            acknowledgment.acknowledge();
+            return;
+        }
         String correlationId = text(enriched, "correlationId");
         MDC.put("correlationId", correlationId);
 
         try {
+            // ONE atomic read: the rules, the version describing them, and the
+            // count must all come from the SAME snapshot, or a refresh landing
+            // mid-transaction could stamp a rulesetVersion that does not
+            // actually describe the rules that produced riskScore (ADR-0008).
+            RuleCache.Snapshot ruleset = ruleCache.snapshot();
             Map<String, Object> signals = toSignalMap(enriched.get("signals"));
-            ScoreResult result = evaluator.score(signals, ruleCache.enabledRules());
+            ScoreResult result = evaluator.score(signals, ruleset.rules());
 
             ObjectNode scored = enriched.deepCopy();
             scored.put("riskScore", result.riskScore());
             scored.set("triggeredRules", objectMapper.valueToTree(result.triggeredRules()));
-            scored.put("evaluatedRuleCount", ruleCache.enabledRules().size());
-            scored.put("rulesetVersion", ruleCache.rulesetVersion());
+            scored.put("evaluatedRuleCount", ruleset.rules().size());
+            scored.put("rulesetVersion", ruleset.rulesetVersion());
             scored.put("scoredAt", Instant.now().toString());
 
             kafkaTemplate.send(scoredTopic, text(enriched, "customerId"),
@@ -90,7 +118,7 @@ public class EnrichedTransactionListener {
                     meterRegistry.counter("fraud.scoring.rule.triggered", "ruleId", r.ruleId())
                             .increment());
 
-            logExplainability(enriched, result);
+            logExplainability(enriched, result, ruleset.rulesetVersion());
         } finally {
             MDC.remove("correlationId");
         }
@@ -105,8 +133,13 @@ public class EnrichedTransactionListener {
      * <p>The threshold here mirrors the seed policy's ALLOW cutoff. It is a
      * logging heuristic, not a decision: scoring deliberately does not know the
      * policy (ADR-0008).
+     *
+     * @param rulesetVersion the version from the SAME snapshot used to score
+     *   this transaction — not re-read from {@link RuleCache} here, which could
+     *   by now reflect a newer refresh and log a version that does not match
+     *   the score actually reported above.
      */
-    private void logExplainability(ObjectNode enriched, ScoreResult result) {
+    private void logExplainability(ObjectNode enriched, ScoreResult result, String rulesetVersion) {
         String txnId = text(enriched, "transactionId");
         if (result.riskScore() >= 30 || !result.triggeredRules().isEmpty()) {
             String breakdown = result.triggeredRules().stream()
@@ -114,7 +147,7 @@ public class EnrichedTransactionListener {
                             r.ruleId(), r.contribution(), r.actualValue(), r.threshold()))
                     .collect(Collectors.joining(", ", "[", "]"));
             log.info("Scored transactionId={} score={} rules={} rulesetVersion={} degraded={}",
-                     txnId, result.riskScore(), breakdown, ruleCache.rulesetVersion(),
+                     txnId, result.riskScore(), breakdown, rulesetVersion,
                      enriched.path("signalsDegraded").asBoolean(false));
         } else {
             log.debug("Scored transactionId={} score={} (no rules triggered)", txnId, result.riskScore());

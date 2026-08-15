@@ -239,7 +239,7 @@ Full symptom-first guide, including the immortal-Redis-counter bug and the stuck
 | [HLD](docs/HLD.md) | Architecture, the sync/async seam, topic topology, latency budget, failure domains |
 | [LLD](docs/LLD.md) | Cross-cutting design + [per-service](docs/lld/) internals, class designs, sequence diagrams |
 | [CONTRACTS](docs/CONTRACTS.md) | JSON Schema for every message shape. **Load-bearing** — there is no shared DTO jar |
-| [ADRs](docs/adr/) | 14 decisions, each with its naive alternative and named failure mode |
+| [ADRs](docs/adr/) | 15 decisions, each with its naive alternative and named failure mode |
 | [TEST_PLAN](docs/TEST_PLAN.md) | T1–T10 acceptance criteria |
 | [RUNBOOK](docs/RUNBOOK.md) | Symptom-first operations guide |
 | [INTERVIEW_PREP](docs/INTERVIEW_PREP.md) | Design walkthrough, trade-off drills, failure-mode Q&A |
@@ -321,9 +321,9 @@ Built in the phase order of spec §12, each phase gated on its acceptance tests.
 | 2a | `ingestion-service` + outbox | **T3, T4** | [#11](../../pull/11) | ✅ |
 | 2b | `mock-payment-api` + gateway skeleton | 8 tests; sync leg wired | [#13](../../pull/13) | ✅ |
 | 3a | `enrichment-service` + Lua signals | **Lua concurrency 5/5** | [#15](../../pull/15) | ✅ |
-| 3b | `scoring-service` + rule engine | **T8 5/5, T2 scoring half, 7 unit** | — | ✅ |
+| 3b | `scoring-service` + rule engine | **T8 5/5, T2 scoring half, 7 unit** | [#16](../../pull/16) | ✅ |
 | 4 | `decision-service` + the sync facade | **sync-facade 4/4, 12 gateway, 11 policy** | [#17](../../pull/17) | ✅ |
-| 5 | `action-audit-service` + reconciliation | **T9 3/3**; T7b + T10 need the full stack | — | 🔄 |
+| 5 | `action-audit-service` + reconciliation | **T9 3/3**; T7b + T10 need the full stack | [#18](../../pull/18) | 🔄 |
 | 6 | Cooperative rebalance proof | **T5** | — | ⬜ |
 
 **All 7 services built**, every one verified against real Kafka / Redis / Couchbase — never
