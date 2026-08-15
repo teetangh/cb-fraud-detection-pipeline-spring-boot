@@ -6,7 +6,7 @@ completes, within a hard 150ms budget — over a fully asynchronous Kafka backbo
 Everything runs locally on real infrastructure: real Kafka, real Redis, real Couchbase. No
 in-memory fakes, no cloud dependency, one `docker compose up`.
 
-> **Status: five of seven services built and tested; decision + audit remain.**
+> **Status: six of seven services built and tested; the sync facade works end to end.**
 > Phase 1 (infra + the Couchbase CE capability gate) and Phase 2a (`ingestion-service`, with
 > **T3 and T4 passing** against real Kafka/Redis/Couchbase) are done. Implementation follows the
 > phase order in [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt) — see
@@ -322,11 +322,11 @@ Built in the phase order of spec §12, each phase gated on its acceptance tests.
 | 2b | `mock-payment-api` + gateway skeleton | 8 tests; sync leg wired | [#13](../../pull/13) | ✅ |
 | 3a | `enrichment-service` + Lua signals | **Lua concurrency 5/5** | [#15](../../pull/15) | ✅ |
 | 3b | `scoring-service` + rule engine | **T8 5/5, T2 scoring half, 7 unit** | — | ✅ |
-| 4 | `decision-service` + the sync facade | **T1, T6, T7a** | — | ⬜ |
+| 4 | `decision-service` + the sync facade | **sync-facade 4/4, 12 gateway tests** | — | 🔄 |
 | 5 | `action-audit-service` + reconciliation | **T7b, T9, T10** | — | ⬜ |
 | 6 | Cooperative rebalance proof | **T5** | — | ⬜ |
 
-**5 of 7 services built**, every one verified against real Kafka / Redis / Couchbase — never
+**6 of 7 services built**, every one verified against real Kafka / Redis / Couchbase — never
 in-memory fakes.
 
 ### Known gaps, tracked not forgotten

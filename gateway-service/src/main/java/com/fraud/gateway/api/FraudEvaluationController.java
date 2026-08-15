@@ -2,6 +2,7 @@ package com.fraud.gateway.api;
 
 import com.fraud.gateway.domain.FraudDecisionResponse;
 import com.fraud.gateway.domain.TransactionRequest;
+import com.fraud.gateway.infra.DecisionWaiter;
 import com.fraud.gateway.infra.HmacJwtVerifier;
 import com.fraud.gateway.infra.IngestionClient;
 import com.fraud.gateway.infra.RateLimiter;
@@ -31,34 +32,33 @@ public class FraudEvaluationController {
     private final HmacJwtVerifier jwtVerifier;
     private final RateLimiter rateLimiter;
     private final IngestionClient ingestionClient;
+    private final DecisionWaiter decisionWaiter;
     private final Timer latencyTimer;
     private final Counter authFailedCounter;
 
     public FraudEvaluationController(HmacJwtVerifier jwtVerifier,
                                      RateLimiter rateLimiter,
                                      IngestionClient ingestionClient,
+                                     DecisionWaiter decisionWaiter,
                                      MeterRegistry meterRegistry) {
         this.jwtVerifier = jwtVerifier;
         this.rateLimiter = rateLimiter;
         this.ingestionClient = ingestionClient;
+        this.decisionWaiter = decisionWaiter;
         this.latencyTimer = Timer.builder("fraud.gateway.decision.latency")
                 .description("Full evaluate round trip").register(meterRegistry);
         this.authFailedCounter = Counter.builder("fraud.gateway.auth.failed").register(meterRegistry);
     }
 
     /**
-     * PHASE 2b SCOPE: authenticate, rate limit, mint the correlation ID, and make
-     * the fast synchronous call to ingestion.
+     * The sync facade: authenticate, rate limit, mint the correlation ID,
+     * SUBSCRIBE to the decision channel, then call ingestion, then wait up to
+     * 150ms for the real decision.
      *
-     * <p>The bounded Redis Pub/Sub wait — the actual sync facade — lands in Phase
-     * 4b, once decision-service exists to publish into it. Until then this
-     * returns {@code REVIEW} with {@code resolvedBy=TIMEOUT_DEFAULT}, which is
-     * honest: no decision was reached.
-     *
-     * <p>It deliberately does NOT return a placeholder ALLOW. That would be the
-     * precise fail-wide-open behaviour ADR-0004 exists to prevent, and — worse —
-     * it would be indistinguishable in the logs and metrics from a real ALLOW,
-     * so the safety property would look implemented while being absent.
+     * <p>On timeout the caller gets REVIEW with {@code resolvedBy=TIMEOUT_DEFAULT}
+     * — never ALLOW (§9.8, ADR-0004). The pipeline is not cancelled: the real
+     * decision is still written to Couchbase and reconciled by webhook if it
+     * differs.
      */
     @PostMapping("/evaluate")
     public Mono<ResponseEntity<FraudDecisionResponse>> evaluate(
@@ -83,15 +83,24 @@ public class FraudEvaluationController {
                                 .header(HttpHeaders.RETRY_AFTER, "60")
                                 .<FraudDecisionResponse>build());
                     }
-                    return ingestionClient.ingest(request, correlationId)
-                            .then(Mono.fromSupplier(() -> {
-                                long latencyMs = (System.nanoTime() - startNanos) / 1_000_000;
-                                latencyTimer.record(java.time.Duration.ofMillis(latencyMs));
-                                log.info("Ingested transactionId={} correlationId={} latencyMs={}",
-                                         request.transactionId(), correlationId, latencyMs);
-                                return ResponseEntity.ok(FraudDecisionResponse.pendingPipeline(
-                                        request.transactionId(), correlationId, latencyMs));
-                            }));
+                    // SUBSCRIBE FIRST, then ingest. The ingestion call is passed
+                    // as a supplier so DecisionWaiter can run it only once the
+                    // Pub/Sub subscription is confirmed live — reversing this
+                    // loses a race precisely when the pipeline is healthy and
+                    // fast (ADR-0003).
+                    return decisionWaiter.awaitDecision(
+                                    request.transactionId(), correlationId,
+                                    () -> ingestionClient.ingest(request, correlationId),
+                                    startNanos)
+                            .map(decision -> {
+                                latencyTimer.record(java.time.Duration.ofMillis(decision.latencyMs()));
+                                log.info("Decision transactionId={} decision={} score={} "
+                                         + "resolvedBy={} latencyMs={} correlationId={}",
+                                         request.transactionId(), decision.decision(),
+                                         decision.riskScore(), decision.resolvedBy(),
+                                         decision.latencyMs(), correlationId);
+                                return ResponseEntity.ok(decision);
+                            });
                 })
                 .onErrorResume(e -> {
                     // Ingestion unreachable means nothing was made durable, so
