@@ -6,7 +6,7 @@ completes, within a hard 150ms budget — over a fully asynchronous Kafka backbo
 Everything runs locally on real infrastructure: real Kafka, real Redis, real Couchbase. No
 in-memory fakes, no cloud dependency, one `docker compose up`.
 
-> **Status: infra and the ingestion path are built and tested; six services remain.**
+> **Status: infra, the synchronous leg and enrichment are built and tested; three services remain.**
 > Phase 1 (infra + the Couchbase CE capability gate) and Phase 2a (`ingestion-service`, with
 > **T3 and T4 passing** against real Kafka/Redis/Couchbase) are done. Implementation follows the
 > phase order in [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt) — see
@@ -320,7 +320,8 @@ Built in the phase order of spec §12, each phase gated on its acceptance tests.
 | 1 | Infra skeleton + init jobs | Topics, bucket, seed rules, **CE transaction probe** | ✅ Done |
 | 2a | `ingestion-service` + outbox | **T3, T4** | ✅ Done |
 | 2b | `mock-payment-api` + gateway skeleton | full sync chain | ✅ Done |
-| 3 | Enrichment + scoring | T2, T8, Lua concurrency | ⬜ |
+| 3a | `enrichment-service` + Lua signals | **Lua concurrency** | ✅ Done |
+| 3b | `scoring-service` + rule engine | T2, T8 | ⬜ |
 | 4 | Decision + sync facade | T1, T6, T7a | ⬜ |
 | 5 | Action, audit, reconciliation | T7b, T9, T10 | ⬜ |
 | 6 | Rebalance behaviour | T5 | ⬜ |

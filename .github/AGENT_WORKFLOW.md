@@ -98,7 +98,30 @@ gh pr view <N> --json statusCheckRollup \
   --jq '.statusCheckRollup[] | select(.name == "CodeRabbit") | .conclusion'
 ```
 
-`SUCCESS` = review complete, go fetch the inline comments. `PENDING` = keep waiting.
+`PENDING` = keep waiting. But **`SUCCESS` is not sufficient on its own** — see below.
+
+#### `SUCCESS` does not mean "reviewed"
+
+CodeRabbit's check goes green **even when it declined to review**. On PR #13 it had hit its
+open-source rate limit, posted zero findings, said *"Next review available in: 51 minutes"* — and
+reported `SUCCESS`. The conclusion conflates two completely different outcomes:
+
+- *reviewed, nothing to say* → the gate is genuinely satisfied
+- *declined to review* → **nothing was reviewed at all**
+
+Only the comment body tells them apart. So after the check goes green, confirm which happened:
+
+```bash
+gh pr view <N> --json comments \
+  --jq '.comments[] | select(.author.login=="coderabbitai") | .body' | grep -i "rate limit\|review available in"
+```
+
+A hit means it declined. Treat that as a **timeout, not a clean review**: proceed on your own
+review and say on the PR that CodeRabbit declined and why you merged anyway. Do not record a
+declined review as "CodeRabbit found nothing" — that is a false clean bill of health, and it is
+worse than no review because it looks like coverage that never happened.
+
+If its stated retry window fits inside the 45-minute bound, waiting for it is the better call.
 
 **Bound the wait to ~45 minutes.** CodeRabbit's free tier rate-limits, and a rate-limited review
 can take that long or never arrive. This is not hypothetical: on PR #11 an agent waited 69 minutes
