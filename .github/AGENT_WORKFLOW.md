@@ -6,6 +6,20 @@ before touching anything.**
 
 ---
 
+## Isolation — structural, not by instruction
+
+**Every PR agent runs in its own git worktree.** Not as a nicety: the implementer is building the
+*next* phase in the main working tree at the same time, on a different branch.
+
+Telling an agent "touch nothing outside `pN`" does not achieve this. Both processes share one
+checkout, so the agent's edits land on whatever branch the implementer currently has checked out.
+That happened on PR #11: the agent's review fixes were written into the tree while the implementer
+was on `p3-gateway`, so they sat uncommitted on the wrong branch and never reached the PR at all —
+one `git checkout` from being lost silently.
+
+Spawn with worktree isolation, and treat any instruction-based separation as advisory on top of
+it, never as the mechanism.
+
 ## Roles
 
 | Role | Does | Never does |
