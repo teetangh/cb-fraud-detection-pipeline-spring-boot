@@ -6,7 +6,7 @@ completes, within a hard 150ms budget — over a fully asynchronous Kafka backbo
 Everything runs locally on real infrastructure: real Kafka, real Redis, real Couchbase. No
 in-memory fakes, no cloud dependency, one `docker compose up`.
 
-> **Status: infra, the synchronous leg and enrichment are built and tested; three services remain.**
+> **Status: five of seven services built and tested; decision + audit remain.**
 > Phase 1 (infra + the Couchbase CE capability gate) and Phase 2a (`ingestion-service`, with
 > **T3 and T4 passing** against real Kafka/Redis/Couchbase) are done. Implementation follows the
 > phase order in [the spec's §12](FRAUD_PIPELINE_BUILD_SPEC.txt) — see
@@ -314,17 +314,29 @@ first thing to fix.
 
 Built in the phase order of spec §12, each phase gated on its acceptance tests.
 
-| Phase | Scope | Exit criteria | Status |
-|---|---|---|---|
-| — | Design, contracts, ADRs, backlog | — | ✅ Done |
-| 1 | Infra skeleton + init jobs | Topics, bucket, seed rules, **CE transaction probe** | ✅ Done |
-| 2a | `ingestion-service` + outbox | **T3, T4** | ✅ Done |
-| 2b | `mock-payment-api` + gateway skeleton | full sync chain | ✅ Done |
-| 3a | `enrichment-service` + Lua signals | **Lua concurrency** | ✅ Done |
-| 3b | `scoring-service` + rule engine | T2, T8 | ⬜ |
-| 4 | Decision + sync facade | T1, T6, T7a | ⬜ |
-| 5 | Action, audit, reconciliation | T7b, T9, T10 | ⬜ |
-| 6 | Rebalance behaviour | T5 | ⬜ |
+| Phase | Scope | Exit criteria | PR | Status |
+|---|---|---|---|---|
+| — | Design, contracts, 15 ADRs, backlog | — | — | ✅ |
+| 1 | Infra skeleton + init jobs | topics, bucket, seed rules, **CE transaction probe 6/6** | [#10](../../pull/10) | ✅ |
+| 2a | `ingestion-service` + outbox | **T3, T4** | [#11](../../pull/11) | ✅ |
+| 2b | `mock-payment-api` + gateway skeleton | 8 tests; sync leg wired | [#13](../../pull/13) | ✅ |
+| 3a | `enrichment-service` + Lua signals | **Lua concurrency 5/5** | [#15](../../pull/15) | ✅ |
+| 3b | `scoring-service` + rule engine | **T8 5/5, T2 scoring half, 7 unit** | — | ✅ |
+| 4 | `decision-service` + the sync facade | **T1, T6, T7a** | — | ⬜ |
+| 5 | `action-audit-service` + reconciliation | **T7b, T9, T10** | — | ⬜ |
+| 6 | Cooperative rebalance proof | **T5** | — | ⬜ |
+
+**5 of 7 services built**, every one verified against real Kafka / Redis / Couchbase — never
+in-memory fakes.
+
+### Known gaps, tracked not forgotten
+
+| | |
+|---|---|
+| [#9](../../issues/9) | No circuit breaker on gateway → ingestion. The *slow* case, not the dead one, is what hurts. |
+| [#12](../../issues/12) | Residual outbox double-publish window on ack-timeout. Needs a CAS claim + a dedup key consumed by enrichment. |
+| [#14](../../issues/14) | `mock-payment-api` has no tests. It is a stub, but that should be a decision rather than an omission. |
+| — | The full-stack T10 run needs ~4.6 GB and has not yet been executed on this machine. |
 
 Not "done" until T1–T10 pass against the real Compose stack, not only against Testcontainers.
 
