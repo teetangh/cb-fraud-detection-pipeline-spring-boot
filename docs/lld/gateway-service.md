@@ -148,6 +148,25 @@ Authorization: Bearer <base64url(header)>.<base64url(payload)>.<base64url(HMAC-S
 Verified with `javax.crypto.Mac` and `MessageDigest.isEqual` for **constant-time comparison** — a
 `String.equals` on a MAC is a timing oracle. Secret from `JWT_SECRET`.
 
+**The `exp` claim is enforced** ([#27](../../issues/27)). The signature check alone left the
+minter's `exp = iat + 300` decorative, which meant a token that leaked once was valid forever —
+the bounded lifetime is the main thing limiting the blast radius of a token pulled from a log or a
+captured request. Three details are deliberate:
+
+- **Signature first, claims second.** `exp` is only parsed after `MessageDigest.isEqual` passes.
+  Parsing claims out of an unverified token is acting on attacker-controlled input, and doing it in
+  this order is also what makes extending `exp` require the secret.
+- **A missing `exp` is a rejection, not a licence.** Treating "no expiry claim" as "never expires"
+  hands anyone able to influence the payload the trivial bypass: omit the field. Same for a
+  non-numeric one, which is a clean `false` rather than a 500 — otherwise malformed input becomes a
+  denial-of-service surface.
+- **60s clock-skew tolerance**, so minor NTP drift between services does not present as intermittent
+  401s with no bad actor involved. Well below the 300s lifetime, so it does not meaningfully extend
+  the window.
+
+`nbf` and `iat` are not checked. The only minter never sets `nbf`, and forging one requires the
+shared secret, so it is a gap at the trust boundary rather than a live exposure — tracked separately.
+
 `jjwt` was considered and rejected: its Jackson binding pulls Jackson 2 into a Jackson 3 build for
 what amounts to 40 lines of `Mac.doFinal`. Spec §13 explicitly accepts a shared-secret check as
 sufficient; a real IdP with JWKS is [tracked as an issue](../../issues).
@@ -178,6 +197,7 @@ is stated explicitly rather than left implicit: a Redis outage must not stop pay
 | ingestion-service down | 503 to caller. Correct: nothing was made durable, so promising a decision would be a lie. |
 | Pipeline slow | REVIEW at 150ms + webhook reconciliation |
 | Malformed JWT | 401, no pipeline work |
+| Expired JWT (or one with no `exp`) | 401, no pipeline work. 60s skew tolerance — see [#27](../../issues/27) |
 
 Note the asymmetry: a *Redis* failure still returns a usable answer, because the transaction may
 still be ingested. An *ingestion* failure returns 503, because nothing was persisted and there is

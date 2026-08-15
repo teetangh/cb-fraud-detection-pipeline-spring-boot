@@ -57,7 +57,11 @@ public class HmacJwtVerifier {
         this.secret = secret.getBytes(StandardCharsets.UTF_8);
     }
 
-    /** @return the subject claim if the token verifies, otherwise empty. */
+    /**
+     * @return true when the signature is valid <em>and</em> the token has not
+     *         expired; false for every malformed, forged, or expired token.
+     *         Never throws — garbage input must not become a 500.
+     */
     public boolean verify(String bearerToken) {
         if (bearerToken == null || bearerToken.isBlank()) {
             return false;
