@@ -63,6 +63,20 @@ event for a transaction that does not exist, and the pipeline scores a phantom.
 - A post-commit nudge wakes the publisher immediately rather than waiting for the next 200ms tick,
   so the outbox contributes ~0ms to the hot path in the normal case while the timer remains the
   correctness backstop.
+- **Two publish paths mean the row must be *claimed*, not merely checked** (issue #12). The nudge
+  and the scheduled poll can both reach the same row, and both can truthfully observe it as
+  `PENDING` because neither has acked yet. A re-read before publishing narrows that window without
+  closing it — it is check-then-act. The claim is a CAS-guarded `claimedAt` stamp, so exactly one
+  publisher proceeds and the loser is rejected with `CasMismatchException`.
+
+  This is the one place where at-least-once is *not* good enough. Enrichment's velocity counter is
+  not idempotent under redelivery, so a systematic double-publish would double every customer's
+  velocity — inflating precisely the signal the fraud rules key on. Absorbing an occasional
+  duplicate is fine; manufacturing one on every transaction is not.
+
+  The claim deliberately leaves `status` as `PENDING`, so a publisher that dies mid-publish leaves
+  a row `findPending` still returns and whose claim simply expires. Crash recovery falls out of the
+  design rather than needing a reaper and a second index for a state rows hold for milliseconds.
 
 ## Verified by
 

@@ -15,6 +15,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -35,6 +36,19 @@ public class OutboxPublisher {
     private static final Logger log = LoggerFactory.getLogger(OutboxPublisher.class);
     private static final int BATCH_SIZE = 100;
     private static final long ACK_TIMEOUT_SECONDS = 5;
+
+    /**
+     * How long a publish claim is honoured before another publisher may take the
+     * row (issue #12).
+     *
+     * <p>Comfortably above {@link #ACK_TIMEOUT_SECONDS}. If it were below, a
+     * publish that is merely slow — not dead — would be reclaimed underneath
+     * itself and republished, manufacturing the duplicate the claim exists to
+     * prevent. The cost of erring high is only that a genuinely crashed
+     * publisher's rows wait this long before retry; the cost of erring low is a
+     * correctness bug.
+     */
+    private static final Duration CLAIM_STALE_AFTER = Duration.ofSeconds(30);
 
     private final OutboxRepository outboxRepository;
     private final KafkaTemplate<String, String> kafkaTemplate;
@@ -185,12 +199,14 @@ public class OutboxPublisher {
         try {
             List<OutboxEvent> pending = outboxRepository.findPending(BATCH_SIZE);
             for (OutboxEvent event : pending) {
-                // Re-check by KEY before publishing. findPending reads a GSI that
-                // lags ~195ms, so a row the nudge already published and marked
-                // PUBLISHED still shows up here as PENDING. Publishing it again
-                // is a genuine duplicate on the topic, and the velocity counter
-                // is not idempotent under redelivery.
-                if (!outboxRepository.isStillPending(event.outboxId())) {
+                // CLAIM before publishing, never merely check.
+                //
+                // findPending reads a GSI that lags ~195ms, so a row the nudge has
+                // already published still shows up here as PENDING. A re-read
+                // would confirm that truthfully and publish it anyway — both
+                // parties observe PENDING because neither has acked yet. The
+                // claim is atomic, so exactly one of them proceeds (issue #12).
+                if (!outboxRepository.claim(event.outboxId(), CLAIM_STALE_AFTER)) {
                     staleSkipCounter.increment();
                     continue;
                 }
@@ -254,7 +270,16 @@ public class OutboxPublisher {
         }
         // Publish the event we were handed. No findPending, so no waiting on the
         // GSI to index a row committed microseconds ago.
-        publish(committed.event());
+        //
+        // Still goes through the claim: being the fast path is not the same as
+        // being the only path. The scheduled poll may already have picked this
+        // row up, and whichever arrives second must drop it (issue #12).
+        OutboxEvent event = committed.event();
+        if (!outboxRepository.claim(event.outboxId(), CLAIM_STALE_AFTER)) {
+            staleSkipCounter.increment();
+            return;
+        }
+        publish(event);
     }
 
     private void publish(OutboxEvent event) {
@@ -289,6 +314,11 @@ public class OutboxPublisher {
             failedCounter.increment();
             sample.stop(publishLatency);
             // Left PENDING on purpose — the next tick retries it. Nothing is lost.
+            //
+            // Drop the claim too, or the retry waits out CLAIM_STALE_AFTER for no
+            // reason: we know this publisher is alive and has given up, which is
+            // exactly the case the staleness timeout is a poor substitute for.
+            outboxRepository.releaseClaim(event.outboxId());
             log.error("Failed to publish outboxId={} transactionId={}; row stays PENDING and "
                       + "will be retried", event.outboxId(), event.payload().transactionId(), e);
         }
