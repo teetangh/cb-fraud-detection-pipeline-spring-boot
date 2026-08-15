@@ -146,6 +146,25 @@ class ReconciliationWebhookTest {
                     cannot interleave into a lost update; this asserts that holds under real \
                     contention rather than only in sequence.""")
                 .isEqualTo(senders - 1.0);
+
+        // Counting a suppression and actually suppressing it are different claims,
+        // and the counter above only proves the first. A guard that increments the
+        // duplicate counter and then re-applies anyway satisfies it while every one
+        // of the 16 deliveries reverses the payment again.
+        //
+        // Payment.reconciled() carries the CURRENT decision into previousDecision,
+        // so a second apply overwrites REVIEW with BLOCK. This is deterministic
+        // regardless of which thread won the race.
+        Payment after = store.find(txnId).orElseThrow();
+        assertThat(after.previousDecision())
+                .as("""
+                    only one delivery may APPLY, not merely be counted as suppressed. A \
+                    second apply would carry the already-reconciled BLOCK into \
+                    previousDecision, losing the REVIEW the caller was originally told.""")
+                .isEqualTo("REVIEW");
+        assertThat(after.riskScore())
+                .as("the single applied reconciliation is the one that set the score")
+                .isEqualTo(91);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

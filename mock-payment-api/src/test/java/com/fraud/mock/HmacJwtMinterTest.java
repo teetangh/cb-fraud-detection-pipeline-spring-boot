@@ -89,7 +89,8 @@ class HmacJwtMinterTest {
         assertThat(exp)
                 .as("""
                     the token must carry a bounded lifetime. NOTE: gateway's HmacJwtVerifier \
-                    does not currently enforce exp — tracked separately — so this asserts the \
+                    verifies the signature and never reads exp, so this lifetime is not \
+                    currently enforced anywhere — tracked as issue #27. This asserts the \
                     minter's half of the contract is sound and ready for that check to land.""")
                 .isGreaterThan(iat);
     }
