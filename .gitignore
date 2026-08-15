@@ -42,3 +42,6 @@ volumes/
 **/surefire-reports/
 **/failsafe-reports/
 .attach_pid*
+
+# Terminal transcript saved from another session; content lives in docs/INTERVIEW_PREP.md
+services.txt
