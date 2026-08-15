@@ -100,7 +100,7 @@ jobs:
           while IFS= read -r f; do
             d=$(dirname "$f")
             while IFS= read -r link; do
-              case "$link" in http*|\#*|../../issues*|mailto:*) continue ;; esac
+              case "$link" in http*|\#*|../../issues*|../../pull*|mailto:*) continue ;; esac
               target="${link%%#*}"
               [ -z "$target" ] && continue
               if [ ! -e "$d/$target" ]; then
